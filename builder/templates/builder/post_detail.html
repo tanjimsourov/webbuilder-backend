@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <meta name="description" content="{{ page_description }}">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+      {{ theme_css|safe }}
+      {{ base_css|safe }}
+      .wb-meta { display: flex; flex-wrap: wrap; gap: 12px; }
+    </style>
+  </head>
+  <body>
+    <section class="wb-hero">
+      <div class="wb-shell">
+        <div class="wb-hero-panel wb-stack">
+          <div class="wb-eyebrow">Article</div>
+          <h1>{{ post.title }}</h1>
+          {% if post.excerpt %}
+          <p>{{ post.excerpt }}</p>
+          {% endif %}
+          <div class="wb-meta">
+            <span class="wb-badge">{{ post.published_at|date:"M d, Y" }}</span>
+            {% for category in post.categories.all %}
+            <span class="wb-badge">{{ category.name }}</span>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {{ post.body_html|safe }}
+
+    <section class="wb-section">
+      <div class="wb-shell wb-stack">
+        <h2>Comments</h2>
+        <div class="wb-grid wb-grid-2">
+          {% for comment in post.comments.all %}
+            {% if comment.is_approved %}
+            <div class="wb-card wb-stack">
+              <strong>{{ comment.author_name }}</strong>
+              <p>{{ comment.body }}</p>
+            </div>
+            {% endif %}
+          {% empty %}
+            <div class="wb-card wb-stack">
+              <strong>No approved comments yet</strong>
+              <p>Comments can be moderated through the admin or the comment approval API.</p>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </body>
+</html>

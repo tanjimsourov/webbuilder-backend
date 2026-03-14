@@ -1,0 +1,2 @@
+[2026-03-11 21:05:16,236] WARNING builder.search_services: meilisearch-python not installed. Search disabled.
+[2026-03-11 21:06:14,094] WARNING builder.search_services: meilisearch-python not installed. Search disabled.

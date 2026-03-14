@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <meta name="description" content="{{ page_description }}">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+      {{ theme_css|safe }}
+      {{ base_css|safe }}
+      .wb-topbar {
+        padding: 20px 0 0;
+      }
+      .wb-topbar-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 16px 22px;
+      }
+      .wb-cart-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: rgba(8, 17, 32, 0.92);
+        color: white;
+        text-decoration: none;
+        font-weight: 700;
+      }
+      .wb-cart-count {
+        display: inline-flex;
+        min-width: 24px;
+        min-height: 24px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: white;
+        color: #081120;
+        font-size: 0.85rem;
+      }
+      .wb-product-shell {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+        gap: 24px;
+      }
+      .wb-product-gallery {
+        aspect-ratio: 1 / 1;
+        border-radius: calc(var(--wb-radius) * 1.1);
+        overflow: hidden;
+        background:
+          radial-gradient(circle at top left, rgba(36, 99, 235, 0.18), transparent 42%),
+          linear-gradient(160deg, rgba(255, 255, 255, 0.98), rgba(234, 244, 255, 0.94));
+      }
+      .wb-product-gallery img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .wb-price-row {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .wb-price-compare {
+        color: rgba(8, 17, 32, 0.45);
+        text-decoration: line-through;
+        font-weight: 600;
+      }
+      .wb-variant-list {
+        display: grid;
+        gap: 12px;
+      }
+      .wb-variant-tile {
+        padding: 18px 20px;
+        border-radius: 20px;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        background: rgba(255, 255, 255, 0.74);
+      }
+      .wb-form-grid {
+        display: grid;
+        gap: 14px;
+      }
+      .wb-input,
+      .wb-select {
+        width: 100%;
+        min-height: 48px;
+        border-radius: 16px;
+        border: 1px solid rgba(8, 17, 32, 0.12);
+        background: rgba(255, 255, 255, 0.92);
+        padding: 0 14px;
+        font: inherit;
+        color: #081120;
+      }
+      .wb-message {
+        border-radius: 18px;
+        padding: 14px 16px;
+        font-weight: 600;
+      }
+      .wb-message-success {
+        background: rgba(16, 185, 129, 0.12);
+        color: #047857;
+      }
+      .wb-message-error {
+        background: rgba(239, 68, 68, 0.12);
+        color: #b91c1c;
+      }
+      .wb-related-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 20px;
+      }
+      .wb-mini-card {
+        padding: 22px;
+      }
+      @media (max-width: 900px) {
+        .wb-product-shell {
+          grid-template-columns: 1fr;
+        }
+        .wb-topbar-row {
+          flex-direction: column;
+          align-items: stretch;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="wb-topbar">
+      <div class="wb-shell wb-surface wb-topbar-row">
+        <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/">Back to shop</a>
+        <a class="wb-cart-link" href="/preview/{{ site.slug }}/shop/cart/">
+          Cart
+          <span class="wb-cart-count">{{ cart_item_count }}</span>
+        </a>
+      </div>
+    </header>
+
+    <section class="wb-hero">
+      <div class="wb-shell">
+        <div class="wb-product-shell">
+          <div class="wb-stack">
+            <div class="wb-product-gallery wb-surface">
+              {% if product.featured_media and product.featured_media.file %}
+              <img src="{{ product.featured_media.file.url }}" alt="{{ product.title }}">
+              {% endif %}
+            </div>
+            <div class="wb-surface" style="padding: 40px;">
+              {{ product.description_html|safe }}
+            </div>
+          </div>
+
+          <div class="wb-stack">
+            <div class="wb-card wb-stack">
+              <div class="wb-eyebrow">Product page</div>
+              <h1>{{ product.title }}</h1>
+              <p>{{ product.excerpt }}</p>
+              <div class="wb-price-row">
+                {% if default_variant %}
+                <div class="wb-price">${{ default_variant.price }}</div>
+                {% if default_variant.compare_at_price %}
+                <div class="wb-price-compare">${{ default_variant.compare_at_price }}</div>
+                {% endif %}
+                {% endif %}
+              </div>
+              <div class="wb-chip-row" style="margin-top: 0;">
+                {% if product.is_featured %}
+                <span class="wb-badge">Featured</span>
+                {% endif %}
+                {% for category in product.categories.all %}
+                <span class="wb-chip">{{ category.name }}</span>
+                {% endfor %}
+              </div>
+
+              {% if notice == "added" %}
+              <div class="wb-message wb-message-success">Item added to cart.</div>
+              {% endif %}
+              {% if error_message %}
+              <div class="wb-message wb-message-error">{{ error_message }}</div>
+              {% endif %}
+
+              <form class="wb-form-grid" method="post">
+                {% csrf_token %}
+                <label>
+                  <span class="field-label">Variant</span>
+                  <select class="wb-select" name="variant_id">
+                    {% for variant in variants %}
+                    <option value="{{ variant.id }}">
+                      {{ variant.title }} - ${{ variant.price }}
+                      {% if variant.track_inventory %} ({{ variant.inventory }} available){% endif %}
+                    </option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>
+                  <span class="field-label">Quantity</span>
+                  <input class="wb-input" type="number" min="1" name="quantity" value="1">
+                </label>
+                <div class="wb-actions">
+                  <button class="wb-button wb-button-primary" type="submit">Add to cart</button>
+                  <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/cart/">Go to cart</a>
+                </div>
+              </form>
+            </div>
+
+            <div class="wb-card wb-stack">
+              <span class="wb-badge">Variants</span>
+              <div class="wb-variant-list">
+                {% for variant in variants %}
+                <div class="wb-variant-tile">
+                  <strong>{{ variant.title }}</strong>
+                  <div class="wb-price-row" style="margin-top: 8px;">
+                    <span>${{ variant.price }}</span>
+                    {% if variant.compare_at_price %}
+                    <span class="wb-price-compare">${{ variant.compare_at_price }}</span>
+                    {% endif %}
+                  </div>
+                  {% if variant.track_inventory %}
+                  <p style="margin: 10px 0 0;">{{ variant.inventory }} units available</p>
+                  {% else %}
+                  <p style="margin: 10px 0 0;">Unlimited delivery</p>
+                  {% endif %}
+                </div>
+                {% empty %}
+                <div class="wb-variant-tile">
+                  <strong>No active variants</strong>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {% if related_products %}
+    <section class="wb-section">
+      <div class="wb-shell wb-stack">
+        <div>
+          <span class="wb-badge">You may also like</span>
+          <h2 style="margin-top: 16px;">Related products from the same collection.</h2>
+        </div>
+        <div class="wb-related-grid">
+          {% for related in related_products %}
+          <article class="wb-card wb-mini-card wb-stack">
+            <h3>{{ related.title }}</h3>
+            <p>{{ related.excerpt }}</p>
+            <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/{{ related.slug }}/">View product</a>
+          </article>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+    {% endif %}
+  </body>
+</html>

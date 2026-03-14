@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <meta name="description" content="{{ page_description }}">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+      {{ theme_css|safe }}
+      {{ base_css|safe }}
+      {{ page_css|safe }}
+    </style>
+  </head>
+  <body>
+    {{ page_html|safe }}
+    {% if page_js %}
+    <script>{{ page_js|safe }}</script>
+    {% endif %}
+  </body>
+</html>
+

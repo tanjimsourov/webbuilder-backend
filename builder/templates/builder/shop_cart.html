@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <meta name="description" content="{{ page_description }}">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+      {{ theme_css|safe }}
+      {{ base_css|safe }}
+      .wb-cart-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+        gap: 24px;
+      }
+      .wb-line-item {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding: 22px 0;
+        border-bottom: 1px solid rgba(8, 17, 32, 0.08);
+      }
+      .wb-line-item:first-child {
+        padding-top: 0;
+      }
+      .wb-line-item:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+      .wb-mini-row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .wb-input,
+      .wb-select,
+      .wb-textarea {
+        width: 100%;
+        min-height: 48px;
+        border-radius: 16px;
+        border: 1px solid rgba(8, 17, 32, 0.12);
+        background: rgba(255, 255, 255, 0.92);
+        padding: 0 14px;
+        font: inherit;
+        color: #081120;
+      }
+      .wb-textarea {
+        min-height: 110px;
+        padding: 14px;
+        resize: vertical;
+      }
+      .wb-summary-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 0.98rem;
+      }
+      .wb-summary-row strong {
+        color: #081120;
+      }
+      .wb-message {
+        border-radius: 18px;
+        padding: 14px 16px;
+        font-weight: 600;
+      }
+      .wb-message-success {
+        background: rgba(16, 185, 129, 0.12);
+        color: #047857;
+      }
+      .wb-message-error {
+        background: rgba(239, 68, 68, 0.12);
+        color: #b91c1c;
+      }
+      @media (max-width: 900px) {
+        .wb-cart-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <section class="wb-hero">
+      <div class="wb-shell">
+        <div class="wb-hero-panel wb-stack">
+          <div class="wb-eyebrow">Checkout</div>
+          <h1>Review the cart and complete the order.</h1>
+          <p>Shipping, tax, and discount logic is now configured from the builder and applied here at checkout.</p>
+          <div class="wb-actions">
+            <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/">Continue shopping</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="wb-section" style="padding-top: 0;">
+      <div class="wb-shell wb-stack">
+        {% if notice == "added" %}
+        <div class="wb-message wb-message-success">Item added to cart.</div>
+        {% elif notice == "updated" %}
+        <div class="wb-message wb-message-success">Cart updated.</div>
+        {% elif notice == "removed" %}
+        <div class="wb-message wb-message-success">Item removed from cart.</div>
+        {% elif notice == "ordered" %}
+        <div class="wb-message wb-message-success">Order created successfully.</div>
+        {% endif %}
+        {% if error_message %}
+        <div class="wb-message wb-message-error">{{ error_message }}</div>
+        {% endif %}
+
+        {% if completed_order %}
+        <article class="wb-card wb-stack">
+          <span class="wb-badge">Order confirmed</span>
+          <h2>{{ completed_order.order_number }}</h2>
+          <p>Thanks {{ completed_order.customer_name }}. Your order total is ${{ completed_order.total }}.</p>
+          <div class="wb-grid wb-grid-3">
+            <div class="wb-metric">
+              <strong>${{ completed_order.subtotal }}</strong>
+              <span>Subtotal</span>
+            </div>
+            <div class="wb-metric">
+              <strong>${{ completed_order.shipping_total }}</strong>
+              <span>Shipping</span>
+            </div>
+            <div class="wb-metric">
+              <strong>${{ completed_order.tax_total }}</strong>
+              <span>Tax</span>
+            </div>
+          </div>
+        </article>
+        {% endif %}
+
+        <div class="wb-cart-grid">
+          <article class="wb-card wb-stack">
+            <div class="wb-results-head" style="margin-bottom: 0;">
+              <div>
+                <span class="wb-badge">Cart</span>
+                <h2 style="margin-top: 16px;">Items in this order.</h2>
+              </div>
+              <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/">Add more</a>
+            </div>
+
+            {% for item in cart_items %}
+            <div class="wb-line-item">
+              <div class="wb-stack" style="gap: 8px;">
+                <div class="wb-mini-row">
+                  <strong>{{ item.product_variant.product.title }}</strong>
+                  <span class="wb-chip">{{ item.product_variant.title }}</span>
+                </div>
+                <p style="margin: 0;">SKU {{ item.product_variant.sku }} | ${{ item.unit_price }} each</p>
+                <div class="wb-mini-row">
+                  <form method="post" class="wb-mini-row">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="update_item">
+                    <input type="hidden" name="item_id" value="{{ item.id }}">
+                    <input class="wb-input" style="width: 90px;" type="number" min="0" name="quantity" value="{{ item.quantity }}">
+                    <button class="wb-button wb-button-secondary" type="submit">Update</button>
+                  </form>
+                  <form method="post">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="remove_item">
+                    <input type="hidden" name="item_id" value="{{ item.id }}">
+                    <button class="wb-button wb-button-secondary" type="submit">Remove</button>
+                  </form>
+                </div>
+              </div>
+              <strong>${{ item.line_total }}</strong>
+            </div>
+            {% empty %}
+            <div class="wb-stack">
+              <h3>Your cart is empty</h3>
+              <p>Add products from the storefront to start checkout.</p>
+            </div>
+            {% endfor %}
+          </article>
+
+          <article class="wb-card wb-stack">
+            <span class="wb-badge">Order summary</span>
+            <form class="wb-stack" method="post">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="checkout">
+
+              <div class="wb-grid wb-grid-2">
+                <label>
+                  <span class="field-label">Customer name</span>
+                  <input class="wb-input" type="text" name="customer_name" required>
+                </label>
+                <label>
+                  <span class="field-label">Email</span>
+                  <input class="wb-input" type="email" name="customer_email" required>
+                </label>
+                <label>
+                  <span class="field-label">Phone</span>
+                  <input class="wb-input" type="text" name="customer_phone">
+                </label>
+                <label>
+                  <span class="field-label">Shipping country</span>
+                  <input class="wb-input" type="text" name="shipping_country" value="{{ checkout_state.shipping_country|default:'US' }}" placeholder="US">
+                </label>
+                <label>
+                  <span class="field-label">State / region</span>
+                  <input class="wb-input" type="text" name="shipping_state" value="{{ checkout_state.shipping_state }}" placeholder="CA">
+                </label>
+                <label>
+                  <span class="field-label">Shipping city</span>
+                  <input class="wb-input" type="text" name="shipping_city">
+                </label>
+                <label>
+                  <span class="field-label">Billing city</span>
+                  <input class="wb-input" type="text" name="billing_city">
+                </label>
+                <label>
+                  <span class="field-label">Discount code</span>
+                  <input class="wb-input" type="text" name="discount_code" value="{{ checkout_state.discount_code }}" placeholder="SAVE10">
+                </label>
+              </div>
+
+              <label>
+                <span class="field-label">Shipping rate</span>
+                <select class="wb-select" name="shipping_rate_id">
+                  <option value="">Auto-select best available</option>
+                  {% for rate in pricing.available_shipping_rates %}
+                  <option value="{{ rate.id }}"{% if checkout_state.shipping_rate_id == rate.id %} selected{% endif %}>
+                    {{ rate.name }} - ${{ rate.price }} ({{ rate.estimated_days_min }}-{{ rate.estimated_days_max }} days)
+                  </option>
+                  {% endfor %}
+                </select>
+              </label>
+
+              <label>
+                <span class="field-label">Order notes</span>
+                <textarea class="wb-textarea" name="notes" placeholder="Delivery notes, account details, or special requests"></textarea>
+              </label>
+
+              <div class="wb-summary-row">
+                <span>Subtotal</span>
+                <strong>${{ pricing.subtotal }}</strong>
+              </div>
+              <div class="wb-summary-row">
+                <span>Shipping</span>
+                <strong>${{ pricing.shipping_total }}</strong>
+              </div>
+              <div class="wb-summary-row">
+                <span>Tax</span>
+                <strong>${{ pricing.tax_total }}</strong>
+              </div>
+              <div class="wb-summary-row">
+                <span>Discount</span>
+                <strong>-${{ pricing.discount_total }}</strong>
+              </div>
+              <div class="wb-summary-row" style="padding-top: 12px; border-top: 1px solid rgba(8, 17, 32, 0.08);">
+                <span>Total</span>
+                <strong>${{ pricing.total }}</strong>
+              </div>
+
+              {% if pricing.discount %}
+              <p style="margin: 0; color: rgba(8, 17, 32, 0.62);">Discount {{ pricing.discount.code }} applied.</p>
+              {% endif %}
+              {% if pricing.tax_rate %}
+              <p style="margin: 0; color: rgba(8, 17, 32, 0.62);">Tax rule: {{ pricing.tax_rate.name }}</p>
+              {% endif %}
+
+              <div class="wb-actions">
+                <button class="wb-button wb-button-primary" type="submit"{% if not cart_items %} disabled{% endif %}>Create order</button>
+                <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/">Keep browsing</a>
+              </div>
+            </form>
+          </article>
+        </div>
+      </div>
+    </section>
+  </body>
+</html>

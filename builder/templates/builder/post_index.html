@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <meta name="description" content="{{ page_description }}">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+      {{ theme_css|safe }}
+      {{ base_css|safe }}
+      .wb-post-link { text-decoration: none; }
+      .wb-post-link:hover h2 { color: var(--wb-brand); }
+    </style>
+  </head>
+  <body>
+    <section class="wb-hero">
+      <div class="wb-shell">
+        <div class="wb-hero-panel wb-stack">
+          <div class="wb-eyebrow">Publishing Hub</div>
+          <h1>{{ site.name }} Blog</h1>
+          <p>{{ site.tagline|default:site.description }}</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="wb-section">
+      <div class="wb-shell wb-grid wb-grid-2">
+        {% for post in posts %}
+        <article class="wb-card wb-stack">
+          <div class="wb-badge">{{ post.published_at|date:"M d, Y" }}</div>
+          <a class="wb-post-link" href="/preview/{{ site.slug }}/blog/{{ post.slug }}/">
+            <h2>{{ post.title }}</h2>
+          </a>
+          <p>{{ post.excerpt }}</p>
+          <div class="wb-actions">
+            <a class="wb-button wb-button-primary" href="/preview/{{ site.slug }}/blog/{{ post.slug }}/">Read article</a>
+          </div>
+        </article>
+        {% empty %}
+        <div class="wb-card wb-stack">
+          <h2>No published posts yet</h2>
+          <p>Use the CMS APIs or Django admin to publish articles for this site.</p>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+  </body>
+</html>

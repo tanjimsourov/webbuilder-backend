@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <meta name="description" content="{{ page_description }}">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+      {{ theme_css|safe }}
+      {{ base_css|safe }}
+      .wb-topbar {
+        padding: 20px 0 0;
+      }
+      .wb-topbar-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 16px 22px;
+      }
+      .wb-cart-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: rgba(8, 17, 32, 0.92);
+        color: white;
+        text-decoration: none;
+        font-weight: 700;
+      }
+      .wb-cart-count {
+        display: inline-flex;
+        min-width: 24px;
+        min-height: 24px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: white;
+        color: #081120;
+        font-size: 0.85rem;
+      }
+      .wb-filter-panel {
+        padding: 24px;
+      }
+      .wb-filter-grid {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: 1.6fr 1fr 1fr auto;
+      }
+      .wb-filter-input,
+      .wb-filter-select {
+        width: 100%;
+        min-height: 50px;
+        border-radius: 18px;
+        border: 1px solid rgba(8, 17, 32, 0.12);
+        background: rgba(255, 255, 255, 0.92);
+        padding: 0 16px;
+        font: inherit;
+        color: #081120;
+      }
+      .wb-chip-row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 18px;
+      }
+      .wb-chip {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 40px;
+        padding: 0 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(8, 17, 32, 0.12);
+        background: rgba(255, 255, 255, 0.82);
+        color: rgba(8, 17, 32, 0.7);
+        text-decoration: none;
+        font-weight: 600;
+      }
+      .wb-chip-active {
+        background: color-mix(in srgb, var(--wb-brand) 16%, white 84%);
+        color: var(--wb-brand);
+        border-color: color-mix(in srgb, var(--wb-brand) 40%, white 60%);
+      }
+      .wb-results-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 24px;
+      }
+      .wb-catalog-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 24px;
+      }
+      .wb-product-card {
+        overflow: hidden;
+        padding: 0;
+      }
+      .wb-product-media {
+        aspect-ratio: 1 / 1;
+        background:
+          radial-gradient(circle at top left, rgba(36, 99, 235, 0.16), transparent 42%),
+          linear-gradient(160deg, rgba(255, 255, 255, 0.96), rgba(234, 244, 255, 0.94));
+        border-bottom: 1px solid rgba(8, 17, 32, 0.08);
+      }
+      .wb-product-media img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .wb-product-body {
+        padding: 24px;
+      }
+      .wb-product-link {
+        text-decoration: none;
+      }
+      .wb-product-link:hover h2 {
+        color: var(--wb-brand);
+      }
+      .wb-price-row {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .wb-price-compare {
+        color: rgba(8, 17, 32, 0.45);
+        text-decoration: line-through;
+        font-weight: 600;
+      }
+      .wb-kicker {
+        color: rgba(8, 17, 32, 0.62);
+        font-size: 0.92rem;
+      }
+      @media (max-width: 860px) {
+        .wb-filter-grid {
+          grid-template-columns: 1fr;
+        }
+        .wb-topbar-row,
+        .wb-results-head {
+          flex-direction: column;
+          align-items: stretch;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="wb-topbar">
+      <div class="wb-shell wb-surface wb-topbar-row">
+        <div>
+          <div class="wb-eyebrow">Commerce storefront</div>
+          <strong style="display:block; margin-top: 8px; font-family: var(--wb-heading-font); font-size: 1.3rem; color: #081120;">{{ site.name }} Shop</strong>
+        </div>
+        <a class="wb-cart-link" href="/preview/{{ site.slug }}/shop/cart/">
+          Cart
+          <span class="wb-cart-count">{{ cart_item_count }}</span>
+        </a>
+      </div>
+    </header>
+
+    <section class="wb-hero">
+      <div class="wb-shell">
+        <div class="wb-hero-panel wb-stack">
+          <div class="wb-eyebrow">Merchandising</div>
+          <h1>Turn product pages into a real storefront.</h1>
+          <p>{{ site.tagline|default:site.description }}</p>
+          <div class="wb-actions">
+            <a class="wb-button wb-button-primary" href="#catalog">Browse products</a>
+            <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/cart/">Open cart</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="wb-section" id="catalog" style="padding-top: 0;">
+      <div class="wb-shell wb-stack">
+        <form class="wb-surface wb-filter-panel" method="get">
+          <div class="wb-filter-grid">
+            <input class="wb-filter-input" type="search" name="q" value="{{ search_query }}" placeholder="Search products, categories, or SKU">
+            <select class="wb-filter-select" name="category">
+              <option value="">All categories</option>
+              {% for category in categories %}
+              <option value="{{ category.slug }}"{% if active_category == category.slug %} selected{% endif %}>{{ category.name }}</option>
+              {% endfor %}
+            </select>
+            <select class="wb-filter-select" name="sort">
+              <option value="newest"{% if active_sort == "newest" %} selected{% endif %}>Newest</option>
+              <option value="price_asc"{% if active_sort == "price_asc" %} selected{% endif %}>Price: Low to high</option>
+              <option value="price_desc"{% if active_sort == "price_desc" %} selected{% endif %}>Price: High to low</option>
+              <option value="title_asc"{% if active_sort == "title_asc" %} selected{% endif %}>Title: A-Z</option>
+              <option value="title_desc"{% if active_sort == "title_desc" %} selected{% endif %}>Title: Z-A</option>
+            </select>
+            <button class="wb-button wb-button-primary" type="submit">Apply</button>
+          </div>
+          <div class="wb-chip-row">
+            <a class="wb-chip{% if not active_category %} wb-chip-active{% endif %}" href="/preview/{{ site.slug }}/shop/?q={{ search_query|urlencode }}&sort={{ active_sort }}">All</a>
+            {% for category in categories %}
+            <a class="wb-chip{% if active_category == category.slug %} wb-chip-active{% endif %}" href="/preview/{{ site.slug }}/shop/?category={{ category.slug }}&q={{ search_query|urlencode }}&sort={{ active_sort }}">{{ category.name }}</a>
+            {% endfor %}
+          </div>
+        </form>
+
+        <div class="wb-results-head">
+          <div>
+            <span class="wb-badge">Catalog</span>
+            <p class="wb-kicker">Search, sort, and merchandise products without leaving the builder.</p>
+          </div>
+          <p class="wb-kicker">{{ catalog_items|length }} product{{ catalog_items|length|pluralize }}</p>
+        </div>
+
+        <div class="wb-catalog-grid">
+          {% for item in catalog_items %}
+          <article class="wb-card wb-product-card">
+            <div class="wb-product-media">
+              {% if item.product.featured_media and item.product.featured_media.file %}
+              <img src="{{ item.product.featured_media.file.url }}" alt="{{ item.product.title }}">
+              {% endif %}
+            </div>
+            <div class="wb-product-body wb-stack">
+              <div class="wb-chip-row" style="margin-top: 0;">
+                {% if item.product.is_featured %}
+                <span class="wb-badge">Featured</span>
+                {% endif %}
+                {% for category in item.product.categories.all|slice:":2" %}
+                <span class="wb-chip">{{ category.name }}</span>
+                {% endfor %}
+              </div>
+              <a class="wb-product-link" href="/preview/{{ site.slug }}/shop/{{ item.product.slug }}/">
+                <h2>{{ item.product.title }}</h2>
+              </a>
+              <p>{{ item.product.excerpt }}</p>
+              <div class="wb-price-row">
+                {% if item.default_variant %}
+                <div class="wb-price">${{ item.default_variant.price }}</div>
+                {% if item.default_variant.compare_at_price %}
+                <div class="wb-price-compare">${{ item.default_variant.compare_at_price }}</div>
+                {% endif %}
+                {% else %}
+                <div class="wb-price">Coming soon</div>
+                {% endif %}
+              </div>
+              <div class="wb-actions">
+                <a class="wb-button wb-button-primary" href="/preview/{{ site.slug }}/shop/{{ item.product.slug }}/">View product</a>
+                <a class="wb-button wb-button-secondary" href="/preview/{{ site.slug }}/shop/cart/">Cart</a>
+              </div>
+            </div>
+          </article>
+          {% empty %}
+          <div class="wb-card wb-stack">
+            <h2>No published products yet</h2>
+            <p>Use the product manager to publish items, then return here to merchandise the storefront.</p>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </body>
+</html>
