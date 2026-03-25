@@ -27,6 +27,35 @@ def env_list(name: str, default: list[str]) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _normalize_origin(value: str) -> str:
+    return value.rstrip("/") if value else value
+
+
+def _merge_origins(*origin_lists: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for origins in origin_lists:
+        for origin in origins:
+            normalized = _normalize_origin(origin)
+            if not normalized or normalized in seen:
+                continue
+            merged.append(normalized)
+            seen.add(normalized)
+    return merged
+
+
+RUNNING_TESTS = any(arg.startswith("test") for arg in sys.argv[1:])
+USE_SQLITE_FOR_TESTS = env_bool("DJANGO_USE_SQLITE_FOR_TESTS", True)
+
+if RUNNING_TESTS and USE_SQLITE_FOR_TESTS:
+    os.environ["DJANGO_DB_ENGINE"] = "django.db.backends.sqlite3"
+    os.environ["DJANGO_DB_NAME"] = str(BASE_DIR / "test_db.sqlite3")
+    os.environ["DJANGO_DB_USER"] = ""
+    os.environ["DJANGO_DB_PASSWORD"] = ""
+    os.environ["DJANGO_DB_HOST"] = ""
+    os.environ["DJANGO_DB_PORT"] = ""
+
+
 DEBUG = env_bool("DJANGO_DEBUG", True)
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
 if not SECRET_KEY:
@@ -185,6 +214,22 @@ CSRF_TRUSTED_ORIGINS = env_list(
     ] if DEBUG else [],
 )
 
+PLATFORM_FRONTEND_ORIGINS = env_list(
+    "DJANGO_PLATFORM_FRONTEND_ORIGINS",
+    [
+        "https://web-builder.husmerk.com",
+        "https://admin-web-builder.husmerk.com",
+        "https://smc-web-builder.husmerk.com",
+    ],
+)
+
+NEXT_PUBLIC_APP_ORIGIN = _normalize_origin(os.environ.get("NEXT_PUBLIC_APP_ORIGIN", ""))
+if NEXT_PUBLIC_APP_ORIGIN:
+    PLATFORM_FRONTEND_ORIGINS.append(NEXT_PUBLIC_APP_ORIGIN)
+
+CORS_ALLOWED_ORIGINS = _merge_origins(CORS_ALLOWED_ORIGINS, PLATFORM_FRONTEND_ORIGINS)
+CSRF_TRUSTED_ORIGINS = _merge_origins(CSRF_TRUSTED_ORIGINS, PLATFORM_FRONTEND_ORIGINS)
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
@@ -221,14 +266,18 @@ SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = os.environ.get("DJANGO_X_FRAME_OPTIONS", "SAMEORIGIN" if DEBUG else "DENY")
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = False
-SESSION_COOKIE_SAMESITE = os.environ.get("DJANGO_SESSION_COOKIE_SAMESITE", "Lax")
-CSRF_COOKIE_SAMESITE = os.environ.get("DJANGO_CSRF_COOKIE_SAMESITE", "Lax")
+DEFAULT_SAMESITE_POLICY = "Lax" if DEBUG else "None"
+SESSION_COOKIE_SAMESITE = os.environ.get("DJANGO_SESSION_COOKIE_SAMESITE", DEFAULT_SAMESITE_POLICY)
+CSRF_COOKIE_SAMESITE = os.environ.get("DJANGO_CSRF_COOKIE_SAMESITE", DEFAULT_SAMESITE_POLICY)
 SESSION_COOKIE_SECURE = env_bool("DJANGO_SESSION_COOKIE_SECURE", not DEBUG)
 CSRF_COOKIE_SECURE = env_bool("DJANGO_CSRF_COOKIE_SECURE", not DEBUG)
 SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", False if DEBUG else True)
 SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_SECURE_HSTS_SECONDS", "0" if DEBUG else "31536000"))
 SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", not DEBUG)
 SECURE_HSTS_PRELOAD = env_bool("DJANGO_SECURE_HSTS_PRELOAD", not DEBUG)
+
+if RUNNING_TESTS:
+    SECURE_SSL_REDIRECT = False
 
 # ---------------------------------------------------------------------------
 # Email Configuration

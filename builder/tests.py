@@ -44,6 +44,10 @@ User = get_user_model()
 
 
 class BuilderPlatformTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        ensure_seed_data()
+
     def setUp(self):
         self.client = Client(enforce_csrf_checks=True)
 

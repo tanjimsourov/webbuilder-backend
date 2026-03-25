@@ -13,6 +13,10 @@ from .models import (
     Domain,
     DomainAvailability,
     DomainContact,
+    EmailDomain,
+    EmailProvisioningTask,
+    MailAlias,
+    Mailbox,
     ExperimentEvent,
     Form,
     FormSubmission,
@@ -2013,3 +2017,224 @@ class InviteMemberSerializer(serializers.Serializer):
 class ChangeMemberRoleSerializer(serializers.Serializer):
     """Serializer for changing a member's role."""
     role = serializers.ChoiceField(choices=WorkspaceMembership.ROLE_CHOICES)
+
+
+# Email Hosting Serializers
+
+class EmailDomainSerializer(serializers.ModelSerializer):
+    """Serializer for EmailDomain model."""
+    
+    dns_instructions = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = EmailDomain
+        fields = [
+            'id', 'site', 'workspace', 'name', 'status', 'verification_token',
+            'verified_at', 'mx_record', 'spf_record', 'dkim_record', 
+            'dmarc_record', 'dns_instructions', 'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'verification_token', 'verified_at', 'mx_record',
+            'spf_record', 'dkim_record', 'dmarc_record', 'created_at', 'updated_at'
+        ]
+
+    def get_dns_instructions(self, obj):
+        """Get DNS configuration instructions for the domain."""
+        instructions = []
+        if obj.mx_record:
+            instructions.append({
+                'type': 'MX',
+                'name': '@',
+                'value': obj.mx_record,
+                'priority': 10
+            })
+        if obj.spf_record:
+            instructions.append({
+                'type': 'TXT',
+                'name': '@',
+                'value': obj.spf_record
+            })
+        if obj.dkim_record:
+            instructions.append({
+                'type': 'TXT',
+                'name': 'k1._domainkey',
+                'value': obj.dkim_record
+            })
+        if obj.dmarc_record:
+            instructions.append({
+                'type': 'TXT',
+                'name': '_dmarc',
+                'value': obj.dmarc_record
+            })
+        return instructions
+
+    def validate_name(self, value):
+        """Validate domain name format and uniqueness."""
+        if self.instance:
+            # Check if name is being changed
+            if self.instance.name != value:
+                if EmailDomain.objects.filter(name=value).exists():
+                    raise serializers.ValidationError("Domain name already exists.")
+        else:
+            if EmailDomain.objects.filter(name=value).exists():
+                raise serializers.ValidationError("Domain name already exists.")
+        return value
+
+
+class MailboxSerializer(serializers.ModelSerializer):
+    """Serializer for Mailbox model."""
+    
+    email_address = serializers.ReadOnlyField()
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    password = serializers.CharField(write_only=True, required=False)
+    
+    class Meta:
+        model = Mailbox
+        fields = [
+            'id', 'workspace', 'site', 'domain', 'local_part', 'password',
+            'is_active', 'quota_mb', 'last_login', 'user', 'email_address',
+            'domain_name', 'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'workspace', 'site', 'last_login', 'email_address',
+            'domain_name', 'created_at', 'updated_at'
+        ]
+
+    def validate_local_part(self, value):
+        """Validate mailbox local part."""
+        if not value:
+            raise serializers.ValidationError("Local part is required.")
+        
+        # Check for invalid characters
+        invalid_chars = [' ', '/', '\\', ':', '*', '?', '"', '<', '>', '|']
+        if any(char in value for char in invalid_chars):
+            raise serializers.ValidationError("Local part contains invalid characters.")
+        
+        # Check uniqueness within domain
+        domain = self.initial_data.get('domain')
+        if domain:
+            try:
+                domain_obj = EmailDomain.objects.get(id=domain)
+                if Mailbox.objects.filter(domain=domain_obj, local_part=value).exists():
+                    if not self.instance or self.instance.local_part != value:
+                        raise serializers.ValidationError("Mailbox with this local part already exists for this domain.")
+            except EmailDomain.DoesNotExist:
+                raise serializers.ValidationError("Invalid domain.")
+        
+        return value
+
+    def create(self, validated_data):
+        """Create mailbox with password hashing."""
+        password = validated_data.pop('password', None)
+        if not password:
+            raise serializers.ValidationError("Password is required.")
+        
+        # Hash password (simplified - use proper hashing in production)
+        import hashlib
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        validated_data['password_hash'] = password_hash
+        
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        """Update mailbox with optional password change."""
+        password = validated_data.pop('password', None)
+        if password:
+            import hashlib
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            validated_data['password_hash'] = password_hash
+        
+        return super().update(instance, validated_data)
+
+
+class MailAliasSerializer(serializers.ModelSerializer):
+    """Serializer for MailAlias model."""
+    
+    destination_email = serializers.CharField(source='destination_mailbox.email_address', read_only=True)
+    
+    class Meta:
+        model = MailAlias
+        fields = [
+            'id', 'workspace', 'site', 'source_address', 'destination_mailbox',
+            'destination_email', 'active', 'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'workspace', 'site', 'destination_email', 'created_at', 'updated_at'
+        ]
+
+    def validate_source_address(self, value):
+        """Validate alias source address."""
+        # Check uniqueness
+        if MailAlias.objects.filter(source_address=value).exists():
+            if not self.instance or self.instance.source_address != value:
+                raise serializers.ValidationError("Alias with this source address already exists.")
+        return value
+
+
+class EmailProvisioningTaskSerializer(serializers.ModelSerializer):
+    """Serializer for EmailProvisioningTask model."""
+    
+    class Meta:
+        model = EmailProvisioningTask
+        fields = [
+            'id', 'workspace', 'task_type', 'target_id', 'status',
+            'message', 'payload', 'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'workspace', 'created_at', 'updated_at'
+        ]
+
+
+class EmailDomainCreateSerializer(serializers.Serializer):
+    """Serializer for creating a new email domain."""
+    domain_name = serializers.CharField(max_length=253)
+    site_id = serializers.IntegerField()
+    
+    def validate_domain_name(self, value):
+        """Validate domain name format."""
+        if not value or '.' not in value:
+            raise serializers.ValidationError("Invalid domain name format.")
+        
+        if EmailDomain.objects.filter(name=value).exists():
+            raise serializers.ValidationError("Email domain already exists.")
+        
+        return value
+
+    def validate_site_id(self, value):
+        """Validate site exists and belongs to user's workspace."""
+        try:
+            site = Site.objects.get(id=value)
+            # Additional workspace validation would go here
+            return value
+        except Site.DoesNotExist:
+            raise serializers.ValidationError("Site not found.")
+
+
+class MailboxCreateSerializer(serializers.Serializer):
+    """Serializer for creating a new mailbox."""
+    local_part = serializers.CharField(max_length=64)
+    password = serializers.CharField(min_length=8)
+    quota_mb = serializers.IntegerField(default=1024, min_value=100, max_value=10240)
+    domain_id = serializers.IntegerField()
+    user_id = serializers.IntegerField(required=False, allow_null=True)
+    
+    def validate_local_part(self, value):
+        """Validate mailbox local part."""
+        if not value:
+            raise serializers.ValidationError("Local part is required.")
+        
+        invalid_chars = [' ', '/', '\\', ':', '*', '?', '"', '<', '>', '|']
+        if any(char in value for char in invalid_chars):
+            raise serializers.ValidationError("Local part contains invalid characters.")
+        
+        return value
+
+    def validate_domain_id(self, value):
+        """Validate domain exists and is active."""
+        try:
+            domain = EmailDomain.objects.get(id=value)
+            if domain.status != EmailDomain.DomainStatus.ACTIVE:
+                raise serializers.ValidationError("Domain must be active to create mailboxes.")
+            return value
+        except EmailDomain.DoesNotExist:
+            raise serializers.ValidationError("Domain not found.")

@@ -2,6 +2,14 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .ai_views import AppsCatalogView, AISiteBlueprintApplyView, AISiteBlueprintView, AISuggestionView
+from .email_views import (
+    EmailDomainViewSet,
+    MailboxViewSet,
+    MailAliasViewSet,
+    EmailProvisioningTaskViewSet,
+    EmailDomainCreateView,
+    MailboxCreateView,
+)
 from .platform_admin_views import (
     PlatformAdminOverviewView,
     PlatformAdminUsersView,
@@ -137,6 +145,10 @@ router.register("forms", FormViewSet, basename="form")
 router.register("platform-subscriptions", PlatformSubscriptionViewSet, basename="platform-subscription")
 router.register("platform-offers", PlatformOfferViewSet, basename="platform-offer")
 router.register("platform-email-campaigns", PlatformEmailCampaignViewSet, basename="platform-email-campaign")
+router.register("email-domains", EmailDomainViewSet, basename="email-domain")
+router.register("mailboxes", MailboxViewSet, basename="mailbox")
+router.register("mail-aliases", MailAliasViewSet, basename="mail-alias")
+router.register("email-provisioning-tasks", EmailProvisioningTaskViewSet, basename="email-provisioning-task")
 
 urlpatterns = [
     path("health/", HealthCheckView.as_view(), name="health-check"),
@@ -198,5 +210,7 @@ urlpatterns = [
     path("seo/gsc/status/", GSCStatusView.as_view(), name="gsc-status"),
     path("seo/gsc/properties/", GSCPropertiesView.as_view(), name="gsc-properties"),
     path("seo/gsc/credential/", GSCCredentialUpdateView.as_view(), name="gsc-credential"),
+    path("email-hosting/domains/create/", EmailDomainCreateView.as_view(), name="email-domain-create"),
+    path("email-hosting/mailboxes/create/", MailboxCreateView.as_view(), name="mailbox-create"),
     path("", include(router.urls)),
 ]
