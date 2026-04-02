@@ -1,0 +1,41 @@
+"""CMS domain views (transitional exports)."""
+
+from builder.views import (  # noqa: F401
+    BlockTemplateViewSet,
+    DomainContactViewSet,
+    DomainViewSet,
+    MediaAssetViewSet,
+    MediaFolderViewSet,
+    NavigationMenuViewSet,
+    PageExperimentViewSet,
+    PageRevisionViewSet,
+    PageReviewCommentViewSet,
+    PageReviewViewSet,
+    PageTranslationViewSet,
+    PageViewSet,
+    RobotsTxtViewSet,
+    URLRedirectViewSet,
+    public_page,
+    public_robots,
+    public_sitemap,
+)
+
+__all__ = [
+    "BlockTemplateViewSet",
+    "DomainContactViewSet",
+    "DomainViewSet",
+    "MediaAssetViewSet",
+    "MediaFolderViewSet",
+    "NavigationMenuViewSet",
+    "PageExperimentViewSet",
+    "PageRevisionViewSet",
+    "PageReviewCommentViewSet",
+    "PageReviewViewSet",
+    "PageTranslationViewSet",
+    "PageViewSet",
+    "RobotsTxtViewSet",
+    "URLRedirectViewSet",
+    "public_page",
+    "public_robots",
+    "public_sitemap",
+]

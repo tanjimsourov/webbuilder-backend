@@ -25,18 +25,21 @@ from urllib.error import URLError, HTTPError
 
 
 class SmokeTest:
-    def __init__(self, base_url: str, strict: bool = False):
+    def __init__(self, base_url: str, strict: bool = False, metrics_token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.strict = strict
+        self.metrics_token = metrics_token
         self.passed = 0
         self.failed = 0
         self.warnings = 0
 
-    def _request(self, path: str, method: str = "GET", timeout: int = 10):
+    def _request(self, path: str, method: str = "GET", timeout: int = 10, headers: dict | None = None):
         """Make HTTP request and return response."""
         url = f"{self.base_url}{path}"
         req = Request(url, method=method)
         req.add_header("Accept", "application/json")
+        for header_name, header_value in (headers or {}).items():
+            req.add_header(header_name, header_value)
         
         try:
             with urlopen(req, timeout=timeout) as response:
@@ -56,15 +59,15 @@ class SmokeTest:
     def _check(self, name: str, condition: bool, message: str = ""):
         """Record test result."""
         if condition:
-            print(f"  ✓ {name}")
+            print(f"  Ã¢Å“â€œ {name}")
             self.passed += 1
         else:
-            print(f"  ✗ {name}: {message}")
+            print(f"  Ã¢Å“â€” {name}: {message}")
             self.failed += 1
 
     def _warn(self, name: str, message: str):
         """Record warning."""
-        print(f"  ⚠ {name}: {message}")
+        print(f"  Ã¢Å¡Â  {name}: {message}")
         self.warnings += 1
 
     def test_health_endpoint(self):
@@ -93,7 +96,12 @@ class SmokeTest:
     def test_metrics_endpoint(self):
         """Test metrics endpoint."""
         print("\n[Metrics]")
-        resp = self._request("/api/metrics/")
+        headers = {"X-Metrics-Token": self.metrics_token} if self.metrics_token else None
+        resp = self._request("/api/metrics/", headers=headers)
+
+        if resp.get("status") == 404 and not self.metrics_token:
+            self._warn("Metrics", "Endpoint is protected. Set --metrics-token to validate it.")
+            return
         
         self._check(
             "Metrics endpoint reachable",
@@ -149,14 +157,19 @@ class SmokeTest:
         endpoints = [
             ("/api/auth/status/", "Auth status"),
             ("/api/health/", "Health check"),
-            ("/api/metrics/", "Metrics"),
+            ("/api/metrics/", "Metrics", {"X-Metrics-Token": self.metrics_token} if self.metrics_token else None),
         ]
         
-        for path, name in endpoints:
-            resp = self._request(path)
+        for item in endpoints:
+            if len(item) == 3:
+                path, name, headers = item
+            else:
+                path, name = item
+                headers = None
+            resp = self._request(path, headers=headers)
             self._check(
                 f"{name} responds",
-                resp.get("status") in [200, 401, 403],
+                resp.get("status") in [200, 401, 403, 404],
                 f"Status: {resp.get('status')}"
             )
 
@@ -216,13 +229,13 @@ class SmokeTest:
         print(f"Results: {self.passed} passed, {self.failed} failed, {self.warnings} warnings")
         
         if self.failed > 0:
-            print("\n✗ SMOKE TEST FAILED")
+            print("\nÃ¢Å“â€” SMOKE TEST FAILED")
             return False
         elif self.warnings > 0 and self.strict:
-            print("\n⚠ SMOKE TEST PASSED WITH WARNINGS (strict mode)")
+            print("\nÃ¢Å¡Â  SMOKE TEST PASSED WITH WARNINGS (strict mode)")
             return False
         else:
-            print("\n✓ SMOKE TEST PASSED")
+            print("\nÃ¢Å“â€œ SMOKE TEST PASSED")
             return True
 
 
@@ -248,10 +261,15 @@ def main():
         action="store_true",
         help="Check S3 storage configuration",
     )
+    parser.add_argument(
+        "--metrics-token",
+        default=os.environ.get("DJANGO_METRICS_AUTH_TOKEN", ""),
+        help="Metrics token for protected /api/metrics/ endpoint",
+    )
     
     args = parser.parse_args()
     
-    tester = SmokeTest(args.base_url, args.strict)
+    tester = SmokeTest(args.base_url, args.strict, metrics_token=args.metrics_token)
     success = tester.run_all(args.check_email, args.check_s3)
     
     return 0 if success else 1

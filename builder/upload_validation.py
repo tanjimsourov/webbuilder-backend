@@ -138,12 +138,66 @@ MIME_TYPE_EXTENSIONS = {
     "application/zip": ["zip"],
 }
 
+MIME_TYPE_ALIASES = {
+    "image/jpg": "image/jpeg",
+    "application/x-zip-compressed": "application/zip",
+    "audio/x-wav": "audio/wav",
+}
+
+
+def _normalize_mime_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    return MIME_TYPE_ALIASES.get(normalized, normalized)
+
+
+def _peek_file_bytes(file, max_bytes: int = 8192) -> bytes:
+    if not hasattr(file, "read"):
+        return b""
+
+    position = None
+    if hasattr(file, "tell"):
+        try:
+            position = file.tell()
+        except Exception:
+            position = None
+
+    data = file.read(max_bytes)
+    if hasattr(file, "seek"):
+        try:
+            if position is not None:
+                file.seek(position)
+            else:
+                file.seek(0)
+        except Exception:
+            pass
+    return data if isinstance(data, bytes) else str(data).encode("utf-8", errors="ignore")
+
+
+def _detect_mime_from_signature(head: bytes) -> str | None:
+    if len(head) >= 3 and head.startswith(b"\xFF\xD8\xFF"):
+        return "image/jpeg"
+    if len(head) >= 8 and head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(head) >= 6 and (head.startswith(b"GIF87a") or head.startswith(b"GIF89a")):
+        return "image/gif"
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    if len(head) >= 4 and head.startswith(b"%PDF"):
+        return "application/pdf"
+    if len(head) >= 4 and head.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "video/mp4"
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "audio/wav"
+    return None
+
 
 def get_file_extension(filename: str) -> str:
     """Get lowercase file extension without the dot."""
     if not filename:
         return ""
-    ext = os.path.splitext(filename)[1].lower()
+    ext = os.path.splitext(os.path.basename(filename))[1].lower()
     return ext[1:] if ext.startswith(".") else ext
 
 
@@ -182,7 +236,16 @@ def validate_file_extension(filename: str) -> Tuple[bool, str]:
     Validate file extension against allowed/blocked lists.
     Returns (is_valid, error_message).
     """
-    ext = get_file_extension(filename)
+    if "\x00" in (filename or ""):
+        return False, "File name contains invalid characters."
+
+    normalized_name = os.path.basename((filename or "").strip())
+    if not normalized_name:
+        return False, "File name is required."
+    if len(normalized_name) > 255:
+        return False, "File name is too long."
+
+    ext = get_file_extension(normalized_name)
     
     if not ext:
         return False, "File must have an extension."
@@ -237,10 +300,21 @@ def validate_mime_type(file, filename: str = None) -> Tuple[bool, str]:
     
     # Try to detect MIME type
     if hasattr(file, "content_type"):
-        mime_type = file.content_type
+        mime_type = _normalize_mime_type(file.content_type)
     else:
         mime_type, _ = mimetypes.guess_type(filename or getattr(file, "name", ""))
-    
+        mime_type = _normalize_mime_type(mime_type or "")
+
+    head = _peek_file_bytes(file)
+    detected_mime = _detect_mime_from_signature(head)
+
+    if detected_mime:
+        expected_exts = MIME_TYPE_EXTENSIONS.get(detected_mime, [])
+        if expected_exts and ext not in expected_exts:
+            return False, f"File signature ({detected_mime}) doesn't match extension (.{ext})."
+        if mime_type and mime_type != detected_mime:
+            return False, f"File content type ({mime_type}) doesn't match detected signature ({detected_mime})."
+
     if not mime_type:
         return True, ""  # Can't determine, allow
     
@@ -270,7 +344,11 @@ def validate_svg_content(file) -> Tuple[bool, str]:
         
         if isinstance(content, str):
             content = content.encode('utf-8')
-        
+
+        decoded = content.decode("utf-8", errors="ignore").lower()
+        if "<svg" not in decoded:
+            return False, "File does not appear to be a valid SVG document."
+
         # Check if SVG is safe
         is_safe, error = is_svg_safe(content)
         if not is_safe:

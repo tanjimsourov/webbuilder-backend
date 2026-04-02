@@ -1,3 +1,5 @@
+import secrets
+
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.conf import settings
 from django.core import signing
@@ -5,6 +7,7 @@ from django.db import models
 from django.http import Http404, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
 from django.utils.decorators import method_decorator
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils import timezone
 from django.utils.html import strip_tags
 from django.contrib.syndication.views import Feed
@@ -16,7 +19,9 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .commerce_runtime import calculate_cart_pricing, shipping_country_for, shipping_state_for
+# TODO: In Phase 5, move all view logic into domain-specific apps. Temporarily
+# keep these runtime helpers imported from the monolith module.
+from .commerce_runtime import calculate_cart_pricing, shipping_country_for, shipping_state_for  # noqa: F401
 
 
 class SiteObjectPermission(permissions.BasePermission):
@@ -562,9 +567,33 @@ class AuthStatusView(APIView):
 
 class AuthBootstrapView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthBootstrapThrottle
+
+        return [AuthBootstrapThrottle()]
 
     def post(self, request):
         from django.db import transaction, IntegrityError
+
+        if not getattr(settings, "AUTH_BOOTSTRAP_ENABLED", settings.DEBUG):
+            return Response(
+                {"detail": "Bootstrap is disabled in this environment."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        bootstrap_token = getattr(settings, "AUTH_BOOTSTRAP_TOKEN", "")
+        if bootstrap_token:
+            provided_token = (
+                request.headers.get("X-Bootstrap-Token")
+                or request.data.get("bootstrap_token", "")
+            )
+            if not secrets.compare_digest(str(provided_token), bootstrap_token):
+                return Response(
+                    {"detail": "Invalid bootstrap token."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
         serializer = AuthBootstrapSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -607,6 +636,12 @@ class AuthBootstrapView(APIView):
 
 class AuthLoginView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthLoginThrottle
+
+        return [AuthLoginThrottle()]
 
     def post(self, request):
         serializer = AuthLoginSerializer(data=request.data)
@@ -672,6 +707,14 @@ class MetricsView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        if not settings.DEBUG:
+            metrics_token = getattr(settings, "METRICS_AUTH_TOKEN", "")
+            if not metrics_token:
+                raise Http404("Not available")
+            provided_token = request.headers.get("X-Metrics-Token") or request.query_params.get("token", "")
+            if not provided_token or not secrets.compare_digest(str(provided_token), metrics_token):
+                raise Http404("Not available")
+
         from django.db import connection
         from .models import Job
 
@@ -707,9 +750,15 @@ class MetricsView(APIView):
 
 class AuthMagicLoginView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthMagicLoginThrottle
+
+        return [AuthMagicLoginThrottle()]
 
     def get(self, request):
-        if not settings.DEBUG:
+        if not getattr(settings, "AUTH_MAGIC_LOGIN_ENABLED", settings.DEBUG):
             raise Http404("Not available")
 
         username = (request.query_params.get("username") or "").strip()
@@ -721,7 +770,13 @@ class AuthMagicLoginView(APIView):
 
         next_url = request.query_params.get("next") or ""
         if next_url:
-            return HttpResponseRedirect(next_url)
+            if url_has_allowed_host_and_scheme(
+                next_url,
+                allowed_hosts=set(settings.ALLOWED_HOSTS),
+                require_https=not settings.DEBUG,
+            ):
+                return HttpResponseRedirect(next_url)
+            return Response({"detail": "Unsafe redirect target."}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(
             {
@@ -1311,7 +1366,18 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         ids = request.data.get("ids", [])
         if not ids:
             return Response({"detail": "Provide 'ids' list."}, status=status.HTTP_400_BAD_REQUEST)
-        assets = MediaAsset.objects.filter(pk__in=ids)
+        try:
+            normalized_ids = [int(item) for item in ids]
+        except (TypeError, ValueError):
+            return Response({"detail": "All ids must be integers."}, status=status.HTTP_400_BAD_REQUEST)
+
+        assets = self.filter_by_site_permission(MediaAsset.objects.filter(pk__in=normalized_ids))
+        if assets.count() != len(set(normalized_ids)):
+            return Response(
+                {"detail": "You don't have permission to delete one or more selected assets."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         for asset in assets:
             try:
                 asset.file.delete(save=False)
@@ -1326,10 +1392,29 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         folder_id = request.data.get("folder_id")
         if not ids:
             return Response({"detail": "Provide 'ids' list."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            normalized_ids = [int(item) for item in ids]
+        except (TypeError, ValueError):
+            return Response({"detail": "All ids must be integers."}, status=status.HTTP_400_BAD_REQUEST)
+
+        assets = self.filter_by_site_permission(MediaAsset.objects.filter(pk__in=normalized_ids))
+        if assets.count() != len(set(normalized_ids)):
+            return Response(
+                {"detail": "You don't have permission to move one or more selected assets."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         folder = None
         if folder_id:
-            folder = get_object_or_404(MediaFolder, pk=folder_id)
-        updated = MediaAsset.objects.filter(pk__in=ids).update(folder=folder)
+            folder = get_object_or_404(self.filter_by_site_permission(MediaFolder.objects.all()), pk=folder_id)
+            if assets.exclude(site_id=folder.site_id).exists():
+                return Response(
+                    {"detail": "Assets can only be moved to a folder in the same site."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        updated = assets.update(folder=folder)
         return Response({"moved": updated})
 
 
@@ -2518,6 +2603,15 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         ensure_seed_data()
         queryset = BlockTemplate.objects.select_related("site").order_by("-is_global", "-usage_count", "name")
+        user = self.request.user
+        if not user.is_authenticated:
+            return queryset.none()
+        if not user.is_superuser:
+            from .workspace_views import filter_sites_by_permission
+
+            allowed_sites = filter_sites_by_permission(user, Site.objects.all())
+            queryset = queryset.filter(models.Q(is_global=True) | models.Q(site__in=allowed_sites))
+
         site_id = self.request.query_params.get("site")
         category = self.request.query_params.get("category")
         is_global = self.request.query_params.get("global")
@@ -2542,6 +2636,50 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
             )
         return queryset
 
+    def _check_template_edit_permission(self, template: BlockTemplate):
+        if template.is_global:
+            if not self.request.user.is_superuser:
+                raise PermissionDenied("Only platform administrators can modify global templates.")
+            return
+
+        site = template.site
+        if site is None:
+            raise PermissionDenied("Template is not associated with a site.")
+
+        from .workspace_views import check_site_permission
+
+        if not check_site_permission(self.request.user, site, require_edit=True):
+            raise PermissionDenied("You don't have permission to edit templates for this site.")
+
+    def _validate_create_update_permissions(self, *, site, is_global: bool):
+        if is_global:
+            if not self.request.user.is_superuser:
+                raise PermissionDenied("Only platform administrators can create or update global templates.")
+            return
+        if site is None:
+            raise ValidationError({"site": "Site is required for non-global templates."})
+        from .workspace_views import check_site_permission
+
+        if not check_site_permission(self.request.user, site, require_edit=True):
+            raise PermissionDenied("You don't have permission to manage templates for this site.")
+
+    def perform_create(self, serializer):
+        site = serializer.validated_data.get("site")
+        is_global = bool(serializer.validated_data.get("is_global", False))
+        self._validate_create_update_permissions(site=site, is_global=is_global)
+        serializer.save()
+
+    def perform_update(self, serializer):
+        template = serializer.instance
+        site = serializer.validated_data.get("site", template.site)
+        is_global = bool(serializer.validated_data.get("is_global", template.is_global))
+        self._validate_create_update_permissions(site=site, is_global=is_global)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_template_edit_permission(instance)
+        instance.delete()
+
     @action(detail=True, methods=["post"])
     def use(self, request, pk=None):
         template = self.get_object()
@@ -2553,6 +2691,7 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
     def publish(self, request, pk=None):
         from .models import BlockTemplate as BT
         template = self.get_object()
+        self._check_template_edit_permission(template)
         template.status = BT.STATUS_PUBLISHED
         template.save(update_fields=["status", "updated_at"])
         return Response(BlockTemplateSerializer(template, context={"request": request}).data)
@@ -2561,6 +2700,7 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
     def unpublish(self, request, pk=None):
         from .models import BlockTemplate as BT
         template = self.get_object()
+        self._check_template_edit_permission(template)
         template.status = BT.STATUS_DRAFT
         template.save(update_fields=["status", "updated_at"])
         return Response(BlockTemplateSerializer(template, context={"request": request}).data)
@@ -2569,6 +2709,7 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
     def submit_to_marketplace(self, request, pk=None):
         from .models import BlockTemplate as BT
         template = self.get_object()
+        self._check_template_edit_permission(template)
         template.status = BT.STATUS_MARKETPLACE
         template.is_global = True
         template.save(update_fields=["status", "is_global", "updated_at"])
@@ -2578,6 +2719,7 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
     def disable(self, request, pk=None):
         from .models import BlockTemplate as BT
         template = self.get_object()
+        self._check_template_edit_permission(template)
         template.status = BT.STATUS_DISABLED
         template.save(update_fields=["status", "updated_at"])
         return Response(BlockTemplateSerializer(template, context={"request": request}).data)

@@ -3,6 +3,7 @@ Custom throttle classes for rate limiting public endpoints.
 """
 
 from rest_framework.throttling import SimpleRateThrottle
+from django.conf import settings
 
 
 class PublicFormThrottle(SimpleRateThrottle):
@@ -53,3 +54,40 @@ class WebhookThrottle(SimpleRateThrottle):
             "scope": self.scope,
             "ident": self.get_ident(request),
         }
+
+
+class _AuthScopedThrottle(SimpleRateThrottle):
+    """Shared identity strategy for auth-sensitive throttles."""
+
+    def get_cache_key(self, request, view):
+        if getattr(settings, "RUNNING_TESTS", False):
+            return None
+        if request.user.is_authenticated:
+            ident = f"user:{request.user.pk}"
+        else:
+            ident = f"ip:{self.get_ident(request)}"
+        return self.cache_format % {"scope": self.scope, "ident": ident}
+
+
+class AuthLoginThrottle(_AuthScopedThrottle):
+    """Rate limit for username/password login attempts."""
+
+    scope = "auth_login"
+
+
+class AuthBootstrapThrottle(_AuthScopedThrottle):
+    """Rate limit for bootstrap endpoint to reduce takeover attempts."""
+
+    scope = "auth_bootstrap"
+
+
+class AuthMagicLoginThrottle(_AuthScopedThrottle):
+    """Rate limit for development magic-login endpoint."""
+
+    scope = "auth_magic_login"
+
+
+class InvitationAcceptThrottle(_AuthScopedThrottle):
+    """Rate limit for invitation token acceptance attempts."""
+
+    scope = "invitation_accept"

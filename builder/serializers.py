@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.contrib.auth.hashers import make_password
 from django.db import transaction
 from django.utils.text import slugify
 from rest_framework import serializers
@@ -2128,22 +2129,17 @@ class MailboxSerializer(serializers.ModelSerializer):
         password = validated_data.pop('password', None)
         if not password:
             raise serializers.ValidationError("Password is required.")
-        
-        # Hash password (simplified - use proper hashing in production)
-        import hashlib
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        validated_data['password_hash'] = password_hash
-        
+
+        validated_data['password_hash'] = make_password(password)
+
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
         """Update mailbox with optional password change."""
         password = validated_data.pop('password', None)
         if password:
-            import hashlib
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            validated_data['password_hash'] = password_hash
-        
+            validated_data['password_hash'] = make_password(password)
+
         return super().update(instance, validated_data)
 
 

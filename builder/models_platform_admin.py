@@ -41,7 +41,7 @@ class PlatformSubscription(models.Model):
         (BILLING_CUSTOM, "Custom"),
     ]
 
-    workspace = models.OneToOneField("Workspace", related_name="platform_subscription", on_delete=models.CASCADE)
+    workspace = models.OneToOneField("core.Workspace", related_name="platform_subscription", on_delete=models.CASCADE)
     plan = models.CharField(max_length=20, choices=PLAN_CHOICES, default=PLAN_STARTER)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_TRIALING)
     billing_cycle = models.CharField(max_length=20, choices=BILLING_CHOICES, default=BILLING_MONTHLY)

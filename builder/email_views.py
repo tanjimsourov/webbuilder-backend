@@ -1,8 +1,10 @@
 """Email hosting viewsets for SMC Web Builder."""
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import make_password
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -127,11 +129,8 @@ class MailboxViewSet(SitePermissionMixin, viewsets.ModelViewSet):
                 {'error': 'Password must be at least 8 characters long'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Hash new password
-        import hashlib
-        password_hash = hashlib.sha256(new_password.encode()).hexdigest()
-        mailbox.password_hash = password_hash
+
+        mailbox.password_hash = make_password(new_password)
         mailbox.save()
         
         # Create provisioning task
@@ -237,13 +236,13 @@ class EmailHostingAPIView(APIView):
                 workspace = user_workspaces.get(id=workspace_id)
                 return workspace
             except Exception:
-                raise permissions.PermissionDenied("Invalid workspace")
+                raise PermissionDenied("Invalid workspace")
         
         # Return first workspace if none specified
         if user_workspaces.exists():
             return user_workspaces.first()
         
-        raise permissions.PermissionDenied("No workspace found")
+        raise PermissionDenied("No workspace found")
 
 
 class EmailDomainCreateView(EmailHostingAPIView):
@@ -328,12 +327,6 @@ class MailboxCreateView(EmailHostingAPIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Hash password
-        import hashlib
-        password_hash = hashlib.sha256(
-            serializer.validated_data['password'].encode()
-        ).hexdigest()
-        
         # Get user if specified
         user = None
         user_id = serializer.validated_data.get('user_id')
@@ -349,7 +342,7 @@ class MailboxCreateView(EmailHostingAPIView):
             site=domain.site,
             workspace=workspace,
             local_part=serializer.validated_data['local_part'],
-            password_hash=password_hash,
+            password_hash=make_password(serializer.validated_data['password']),
             quota_mb=serializer.validated_data['quota_mb'],
             user=user
         )

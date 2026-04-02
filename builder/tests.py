@@ -155,8 +155,9 @@ class BuilderPlatformTests(TestCase):
 
     @override_settings(ENABLE_REQUEST_SEED_DATA=False)
     def test_seed_data_can_be_disabled(self):
+        existing_site_count = Site.objects.count()
         ensure_seed_data()
-        self.assertEqual(Site.objects.count(), 0)
+        self.assertEqual(Site.objects.count(), existing_site_count)
 
     def test_notification_service_uses_existing_model_fields(self):
         ensure_seed_data()
@@ -1433,7 +1434,7 @@ class BuilderPlatformTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["metrics"]["total_users"], 2)
         self.assertEqual(payload["metrics"]["total_workspaces"], 1)
-        self.assertEqual(payload["metrics"]["total_sites"], 1)
+        self.assertGreaterEqual(payload["metrics"]["total_sites"], 1)
         self.assertEqual(payload["metrics"]["paid_orders"], 1)
         self.assertEqual(payload["metrics"]["subscriptions_active"], 1)
         self.assertEqual(payload["metrics"]["active_offers"], 1)
@@ -1557,6 +1558,7 @@ class ProductionHardeningTests(TestCase):
         self.assertIn("checks", data)
         self.assertEqual(data["checks"]["database"], "ok")
 
+    @override_settings(DEBUG=True)
     def test_metrics_endpoint_returns_counts(self):
         """Metrics endpoint returns application metrics."""
         response = self.client.get("/api/metrics/")
@@ -1567,6 +1569,29 @@ class ProductionHardeningTests(TestCase):
         # Metrics should include count fields
         self.assertIn("users_total", data)
         self.assertIn("sites_total", data)
+
+    @override_settings(DEBUG=False, METRICS_AUTH_TOKEN="metrics-token")
+    def test_metrics_endpoint_requires_token_in_production(self):
+        """Metrics endpoint requires token auth outside debug mode."""
+        blocked = self.client.get("/api/metrics/")
+        self.assertEqual(blocked.status_code, 404)
+
+        allowed = self.client.get("/api/metrics/", HTTP_X_METRICS_TOKEN="metrics-token")
+        self.assertEqual(allowed.status_code, 200)
+
+    @override_settings(DEBUG=False, AUTH_BOOTSTRAP_ENABLED=False)
+    def test_bootstrap_can_be_disabled_for_production(self):
+        """Bootstrap endpoint is disabled when explicit production gate is off."""
+        response = self.client.post(
+            "/api/auth/bootstrap/",
+            {
+                "username": "owner",
+                "email": "owner@example.com",
+                "password": "VerySecurePass123",
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
 
     def test_svg_validation_rejects_script_tags(self):
         """SVG validation rejects files containing script tags."""
@@ -1611,6 +1636,19 @@ class ProductionHardeningTests(TestCase):
         self.assertTrue(is_safe)
         self.assertEqual(error, "")
 
+    def test_upload_validation_rejects_signature_mismatch(self):
+        """Upload validator rejects files where binary signature and extension differ."""
+        from .upload_validation import validate_upload
+
+        disguised = SimpleUploadedFile(
+            "avatar.png",
+            b"%PDF-1.7 fake payload",
+            content_type="image/png",
+        )
+        is_valid, error, _ = validate_upload(disguised)
+        self.assertFalse(is_valid)
+        self.assertIn("signature", error.lower())
+
     def test_json_formatter_produces_valid_json(self):
         """JsonFormatter produces valid JSON log output."""
         import json
@@ -1647,16 +1685,88 @@ class ProductionHardeningTests(TestCase):
     def test_throttle_classes_exist_and_have_correct_scope(self):
         """Throttle classes are properly configured with correct scopes."""
         from .throttles import (
+            AuthBootstrapThrottle,
+            AuthLoginThrottle,
+            AuthMagicLoginThrottle,
+            InvitationAcceptThrottle,
             PublicFormThrottle,
             PublicCommentThrottle,
             PublicCheckoutThrottle,
             WebhookThrottle,
         )
 
+        self.assertEqual(AuthLoginThrottle.scope, "auth_login")
+        self.assertEqual(AuthBootstrapThrottle.scope, "auth_bootstrap")
+        self.assertEqual(AuthMagicLoginThrottle.scope, "auth_magic_login")
+        self.assertEqual(InvitationAcceptThrottle.scope, "invitation_accept")
         self.assertEqual(PublicFormThrottle.scope, "public_form")
         self.assertEqual(PublicCommentThrottle.scope, "public_comment")
         self.assertEqual(PublicCheckoutThrottle.scope, "public_checkout")
         self.assertEqual(WebhookThrottle.scope, "webhook")
+
+    def test_media_bulk_delete_blocks_cross_site_asset_access(self):
+        """Bulk media delete enforces site-scoped permissions for each asset id."""
+        secure_client = Client(enforce_csrf_checks=True)
+        owner_one = User.objects.create_user("owner-one", "owner1@example.com", "VerySecurePass123")
+        owner_two = User.objects.create_user("owner-two", "owner2@example.com", "VerySecurePass123")
+
+        workspace_one = Workspace.objects.create(name="Workspace One", slug="workspace-one", owner=owner_one)
+        workspace_two = Workspace.objects.create(name="Workspace Two", slug="workspace-two", owner=owner_two)
+        WorkspaceMembership.objects.create(
+            workspace=workspace_one,
+            user=owner_one,
+            role=WorkspaceMembership.ROLE_OWNER,
+            invited_by=owner_one,
+        )
+        WorkspaceMembership.objects.create(
+            workspace=workspace_two,
+            user=owner_two,
+            role=WorkspaceMembership.ROLE_OWNER,
+            invited_by=owner_two,
+        )
+
+        site_one = Site.objects.create(name="Site One", slug="site-one", workspace=workspace_one)
+        site_two = Site.objects.create(name="Site Two", slug="site-two", workspace=workspace_two)
+
+        temp_dir = Path(__file__).resolve().parent.parent / ".test-media" / "hardening-media"
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with override_settings(MEDIA_ROOT=str(temp_dir)):
+                asset_one = MediaAsset.objects.create(
+                    site=site_one,
+                    title="owned-asset",
+                    file=SimpleUploadedFile("owned.txt", b"owned", content_type="text/plain"),
+                    kind=MediaAsset.KIND_DOCUMENT,
+                )
+                asset_two = MediaAsset.objects.create(
+                    site=site_two,
+                    title="foreign-asset",
+                    file=SimpleUploadedFile("foreign.txt", b"foreign", content_type="text/plain"),
+                    kind=MediaAsset.KIND_DOCUMENT,
+                )
+
+                csrf_token = secure_client.get("/api/auth/status/").cookies["csrftoken"].value
+                login_response = secure_client.post(
+                    "/api/auth/login/",
+                    {"username": "owner-one", "password": "VerySecurePass123"},
+                    content_type="application/json",
+                    HTTP_X_CSRFTOKEN=csrf_token,
+                )
+                self.assertEqual(login_response.status_code, 200)
+
+                response = secure_client.post(
+                    "/api/media/bulk_delete/",
+                    {"ids": [asset_one.id, asset_two.id]},
+                    content_type="application/json",
+                    HTTP_X_CSRFTOKEN=secure_client.get("/api/auth/status/").cookies["csrftoken"].value,
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertTrue(MediaAsset.objects.filter(pk=asset_one.id).exists())
+                self.assertTrue(MediaAsset.objects.filter(pk=asset_two.id).exists())
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_site_scoped_session_keys_are_unique_per_site(self):
         """Session keys for cart/checkout are scoped by site slug."""

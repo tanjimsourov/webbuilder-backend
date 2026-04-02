@@ -232,6 +232,12 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
 class AcceptInvitationView(APIView):
     """Accept a workspace invitation."""
     permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import InvitationAcceptThrottle
+
+        return [InvitationAcceptThrottle()]
 
     def post(self, request):
         token = request.data.get("token")
@@ -421,3 +427,14 @@ def filter_sites_by_permission(user, queryset):
     return queryset.filter(
         models.Q(workspace__memberships__user=user) | models.Q(workspace__owner=user)
     ).distinct()
+
+
+def get_user_workspaces(user):
+    """Return workspaces the user can access."""
+    if not user.is_authenticated:
+        return Workspace.objects.none()
+    if user.is_superuser:
+        return Workspace.objects.all().order_by("name")
+    return Workspace.objects.filter(
+        models.Q(owner=user) | models.Q(memberships__user=user)
+    ).distinct().order_by("name")

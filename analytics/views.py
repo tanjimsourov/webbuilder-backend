@@ -1,0 +1,41 @@
+"""Analytics domain views (transitional exports)."""
+
+from builder.views import (  # noqa: F401
+    GSCCallbackView,
+    GSCConnectView,
+    GSCCredentialUpdateView,
+    GSCDisconnectView,
+    GSCPropertiesView,
+    GSCStatusView,
+    GSCSyncView,
+    KeywordRankEntryViewSet,
+    LibreCrawlStatusView,
+    PayloadCMSStatusView,
+    PayloadEcommerceStatusView,
+    SEOAnalyticsViewSet,
+    SEOAuditViewSet,
+    SEOSettingsViewSet,
+    SerpBearStatusView,
+    TrackedKeywordViewSet,
+    UmamiStatusView,
+)
+
+__all__ = [
+    "GSCCallbackView",
+    "GSCConnectView",
+    "GSCCredentialUpdateView",
+    "GSCDisconnectView",
+    "GSCPropertiesView",
+    "GSCStatusView",
+    "GSCSyncView",
+    "KeywordRankEntryViewSet",
+    "LibreCrawlStatusView",
+    "PayloadCMSStatusView",
+    "PayloadEcommerceStatusView",
+    "SEOAnalyticsViewSet",
+    "SEOAuditViewSet",
+    "SEOSettingsViewSet",
+    "SerpBearStatusView",
+    "TrackedKeywordViewSet",
+    "UmamiStatusView",
+]

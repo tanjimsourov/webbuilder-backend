@@ -17,10 +17,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .experiments import record_conversion_from_assignments, resolve_public_page_context
-from .models import Form, FormSubmission, Site
-from .serializers import FormSerializer, FormSubmissionSerializer
-from .services import trigger_webhooks
-from .views import SitePermissionMixin
+from core.models import Site
+from core.views import SitePermissionMixin
+from forms.models import Form, FormSubmission
+from forms.serializers import FormSerializer, FormSubmissionSerializer
+from forms.services import trigger_webhooks
 
 
 class FormViewSet(SitePermissionMixin, viewsets.ModelViewSet):
@@ -117,6 +118,12 @@ class FormViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 class PublicFormView(APIView):
     """Public form rendering and submission."""
     permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import PublicFormThrottle
+
+        return [PublicFormThrottle()]
 
     def get(self, request, site_slug: str, form_slug: str):
         """Get form schema for rendering."""
@@ -140,6 +147,8 @@ class PublicFormView(APIView):
         form = get_object_or_404(Form, site=site, slug=form_slug, status=Form.STATUS_ACTIVE)
         
         payload = request.data.get("payload", {})
+        if not isinstance(payload, dict):
+            return Response({"detail": "payload must be a JSON object."}, status=status.HTTP_400_BAD_REQUEST)
         raw_page_path = request.data.get("page_path") or request.META.get("HTTP_REFERER") or ""
         page, translation, locale, normalized_path = resolve_public_page_context(site, raw_page_path)
         

@@ -5,143 +5,31 @@ from django.utils import timezone
 from django.contrib.auth import get_user_model
 from django.conf import settings
 
-
-class TimeStampedModel(models.Model):
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        abstract = True
-
-
-class Site(TimeStampedModel):
-    name = models.CharField(max_length=140)
-    slug = models.SlugField(max_length=160, unique=True)
-    tagline = models.CharField(max_length=180, blank=True)
-    domain = models.CharField(max_length=255, blank=True)
-    description = models.TextField(blank=True)
-    theme = models.JSONField(default=dict, blank=True)
-    navigation = models.JSONField(default=list, blank=True)
-    settings = models.JSONField(default=dict, blank=True)
-    workspace = models.ForeignKey(
-        "Workspace",
-        related_name="sites",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-    )
-
-    class Meta:
-        ordering = ["name"]
-
-    def save(self, *args, **kwargs):
-        is_new = self._state.adding
-        super().save(*args, **kwargs)
-        if is_new:
-            from .localization import ensure_site_locale
-
-            localization = (self.settings or {}).get("localization") or {}
-            default_locale = localization.get("default_locale") or "en"
-            if not self.locales.exists():
-                ensure_site_locale(self, default_locale, is_default=True)
-
-    def __str__(self) -> str:
-        return self.name
-
-
-class SiteLocale(TimeStampedModel):
-    DIRECTION_LTR = "ltr"
-    DIRECTION_RTL = "rtl"
-    DIRECTION_CHOICES = [
-        (DIRECTION_LTR, "Left to right"),
-        (DIRECTION_RTL, "Right to left"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="locales", on_delete=models.CASCADE)
-    code = models.CharField(max_length=32)
-    direction = models.CharField(max_length=3, choices=DIRECTION_CHOICES, default=DIRECTION_LTR)
-    is_default = models.BooleanField(default=False)
-    is_enabled = models.BooleanField(default=True)
-
-    class Meta:
-        ordering = ["-is_default", "code"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "code"], name="unique_site_locale_code"),
-            models.UniqueConstraint(
-                fields=["site"],
-                condition=models.Q(is_default=True),
-                name="unique_default_locale_per_site",
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.code}"
-
-
-class Page(TimeStampedModel):
-    STATUS_DRAFT = "draft"
-    STATUS_PUBLISHED = "published"
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, "Draft"),
-        (STATUS_PUBLISHED, "Published"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="pages", on_delete=models.CASCADE)
-    title = models.CharField(max_length=180)
-    slug = models.SlugField(max_length=180)
-    path = models.CharField(max_length=255)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
-    is_homepage = models.BooleanField(default=False)
-    seo = models.JSONField(default=dict, blank=True)
-    page_settings = models.JSONField(default=dict, blank=True)
-    builder_data = models.JSONField(default=dict, blank=True)
-    html = models.TextField(blank=True)
-    css = models.TextField(blank=True)
-    js = models.TextField(blank=True)
-    published_at = models.DateTimeField(blank=True, null=True)
-    scheduled_at = models.DateTimeField(blank=True, null=True, help_text="Schedule publish time")
-
-    class Meta:
-        ordering = ["-is_homepage", "title"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "path"], name="unique_site_path"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.title}"
-
-
-class PageTranslation(TimeStampedModel):
-    STATUS_DRAFT = "draft"
-    STATUS_PUBLISHED = "published"
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, "Draft"),
-        (STATUS_PUBLISHED, "Published"),
-    ]
-
-    page = models.ForeignKey(Page, related_name="translations", on_delete=models.CASCADE)
-    locale = models.ForeignKey(SiteLocale, related_name="page_translations", on_delete=models.CASCADE)
-    title = models.CharField(max_length=180)
-    slug = models.SlugField(max_length=180)
-    path = models.CharField(max_length=255)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
-    seo = models.JSONField(default=dict, blank=True)
-    page_settings = models.JSONField(default=dict, blank=True)
-    builder_data = models.JSONField(default=dict, blank=True)
-    html = models.TextField(blank=True)
-    css = models.TextField(blank=True)
-    js = models.TextField(blank=True)
-    published_at = models.DateTimeField(blank=True, null=True)
-
-    class Meta:
-        ordering = ["locale__code", "title"]
-        constraints = [
-            models.UniqueConstraint(fields=["page", "locale"], name="unique_page_locale_translation"),
-            models.UniqueConstraint(fields=["locale", "path"], name="unique_locale_translation_path"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.page.title} [{self.locale.code}]"
+from analytics.models import (  # noqa: F401
+    KeywordRankEntry,
+    SEOAnalytics,
+    SEOAudit,
+    SEOSettings,
+    SearchConsoleCredential,
+    TrackedKeyword,
+)
+from blog.models import Comment, Post, PostCategory, PostTag  # noqa: F401
+from commerce.models import (  # noqa: F401
+    Cart,
+    CartItem,
+    DiscountCode,
+    Order,
+    OrderItem,
+    Product,
+    ProductCategory,
+    ProductVariant,
+    ShippingRate,
+    ShippingZone,
+    TaxRate,
+)
+from core.models import Site, SiteLocale, TimeStampedModel, Workspace, WorkspaceInvitation, WorkspaceMembership  # noqa: F401
+from cms.models import Page, PageTranslation  # noqa: F401
+from forms.models import Form, FormSubmission  # noqa: F401
 
 
 class PageExperiment(TimeStampedModel):
@@ -418,356 +306,6 @@ class MediaAsset(TimeStampedModel):
         return f"{self.site.name}: {self.title}"
 
 
-class PostCategory(TimeStampedModel):
-    site = models.ForeignKey(Site, related_name="post_categories", on_delete=models.CASCADE)
-    name = models.CharField(max_length=120)
-    slug = models.SlugField(max_length=140)
-    description = models.TextField(blank=True)
-
-    class Meta:
-        ordering = ["name"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "slug"], name="unique_site_post_category_slug"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.name}"
-
-
-class PostTag(TimeStampedModel):
-    site = models.ForeignKey(Site, related_name="post_tags", on_delete=models.CASCADE)
-    name = models.CharField(max_length=120)
-    slug = models.SlugField(max_length=140)
-
-    class Meta:
-        ordering = ["name"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "slug"], name="unique_site_post_tag_slug"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.name}"
-
-
-class ProductCategory(TimeStampedModel):
-    site = models.ForeignKey(Site, related_name="product_categories", on_delete=models.CASCADE)
-    name = models.CharField(max_length=120)
-    slug = models.SlugField(max_length=140)
-    description = models.TextField(blank=True)
-
-    class Meta:
-        ordering = ["name"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "slug"], name="unique_site_product_category_slug"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.name}"
-
-
-class Product(TimeStampedModel):
-    STATUS_DRAFT = "draft"
-    STATUS_PUBLISHED = "published"
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, "Draft"),
-        (STATUS_PUBLISHED, "Published"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="products", on_delete=models.CASCADE)
-    title = models.CharField(max_length=180)
-    slug = models.SlugField(max_length=180)
-    excerpt = models.TextField(blank=True)
-    description_html = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
-    featured_media = models.ForeignKey(
-        "MediaAsset",
-        related_name="product_featured_for",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
-    categories = models.ManyToManyField(ProductCategory, related_name="products", blank=True)
-    seo = models.JSONField(default=dict, blank=True)
-    settings = models.JSONField(default=dict, blank=True)
-    is_featured = models.BooleanField(default=False)
-    published_at = models.DateTimeField(blank=True, null=True)
-
-    class Meta:
-        ordering = ["-is_featured", "-published_at", "title"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "slug"], name="unique_site_product_slug"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.title}"
-
-
-class ProductVariant(TimeStampedModel):
-    product = models.ForeignKey(Product, related_name="variants", on_delete=models.CASCADE)
-    title = models.CharField(max_length=180)
-    sku = models.CharField(max_length=120)
-    price = models.DecimalField(max_digits=12, decimal_places=2)
-    compare_at_price = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True)
-    inventory = models.IntegerField(default=0)
-    track_inventory = models.BooleanField(default=True)
-    is_default = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
-    attributes = models.JSONField(default=dict, blank=True)
-
-    class Meta:
-        ordering = ["-is_default", "title"]
-        constraints = [
-            models.UniqueConstraint(fields=["product", "sku"], name="unique_product_variant_sku"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.product.title}: {self.title}"
-
-
-class Cart(TimeStampedModel):
-    STATUS_OPEN = "open"
-    STATUS_CONVERTED = "converted"
-    STATUS_ABANDONED = "abandoned"
-    STATUS_CHOICES = [
-        (STATUS_OPEN, "Open"),
-        (STATUS_CONVERTED, "Converted"),
-        (STATUS_ABANDONED, "Abandoned"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="carts", on_delete=models.CASCADE)
-    session_key = models.CharField(max_length=80)
-    currency = models.CharField(max_length=8, default="USD")
-    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_OPEN)
-    converted_at = models.DateTimeField(blank=True, null=True)
-
-    class Meta:
-        ordering = ["-updated_at"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["site", "session_key"],
-                condition=models.Q(status="open"),
-                name="unique_open_cart_for_session",
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.session_key} ({self.status})"
-
-
-class CartItem(TimeStampedModel):
-    cart = models.ForeignKey(Cart, related_name="items", on_delete=models.CASCADE)
-    product_variant = models.ForeignKey(ProductVariant, related_name="cart_items", on_delete=models.CASCADE)
-    quantity = models.PositiveIntegerField(default=1)
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    line_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-
-    class Meta:
-        ordering = ["created_at"]
-        constraints = [
-            models.UniqueConstraint(fields=["cart", "product_variant"], name="unique_cart_variant"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.cart.site.name}: {self.product_variant.title} x {self.quantity}"
-
-
-class Order(TimeStampedModel):
-    STATUS_PENDING = "pending"
-    STATUS_PAID = "paid"
-    STATUS_FULFILLED = "fulfilled"
-    STATUS_CANCELLED = "cancelled"
-    STATUS_CHOICES = [
-        (STATUS_PENDING, "Pending"),
-        (STATUS_PAID, "Paid"),
-        (STATUS_FULFILLED, "Fulfilled"),
-        (STATUS_CANCELLED, "Cancelled"),
-    ]
-
-    PAYMENT_PENDING = "pending"
-    PAYMENT_PAID = "paid"
-    PAYMENT_FAILED = "failed"
-    PAYMENT_REFUNDED = "refunded"
-    PAYMENT_STATUS_CHOICES = [
-        (PAYMENT_PENDING, "Pending"),
-        (PAYMENT_PAID, "Paid"),
-        (PAYMENT_FAILED, "Failed"),
-        (PAYMENT_REFUNDED, "Refunded"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="orders", on_delete=models.CASCADE)
-    order_number = models.CharField(max_length=40, unique=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_PENDING)
-    currency = models.CharField(max_length=8, default="USD")
-    customer_name = models.CharField(max_length=180)
-    customer_email = models.EmailField()
-    customer_phone = models.CharField(max_length=40, blank=True)
-    billing_address = models.JSONField(default=dict, blank=True)
-    shipping_address = models.JSONField(default=dict, blank=True)
-    notes = models.TextField(blank=True)
-    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    shipping_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    pricing_details = models.JSONField(default=dict, blank=True)
-    payment_provider = models.CharField(max_length=80, blank=True)
-    payment_reference = models.CharField(max_length=180, blank=True)
-    placed_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ["-placed_at"]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.order_number}"
-
-
-class OrderItem(models.Model):
-    order = models.ForeignKey(Order, related_name="items", on_delete=models.CASCADE)
-    product = models.ForeignKey(Product, related_name="order_items", on_delete=models.SET_NULL, null=True, blank=True)
-    product_variant = models.ForeignKey(
-        ProductVariant,
-        related_name="order_items",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
-    title = models.CharField(max_length=180)
-    sku = models.CharField(max_length=120)
-    quantity = models.PositiveIntegerField(default=1)
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    line_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    attributes = models.JSONField(default=dict, blank=True)
-
-    class Meta:
-        ordering = ["id"]
-
-    def __str__(self) -> str:
-        return f"{self.order.order_number}: {self.title}"
-
-
-class Post(TimeStampedModel):
-    STATUS_DRAFT = "draft"
-    STATUS_PUBLISHED = "published"
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, "Draft"),
-        (STATUS_PUBLISHED, "Published"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="posts", on_delete=models.CASCADE)
-    title = models.CharField(max_length=180)
-    slug = models.SlugField(max_length=180)
-    excerpt = models.TextField(blank=True)
-    body_html = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
-    featured_media = models.ForeignKey(
-        MediaAsset,
-        related_name="featured_posts",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
-    categories = models.ManyToManyField(PostCategory, related_name="posts", blank=True)
-    tags = models.ManyToManyField(PostTag, related_name="posts", blank=True)
-    seo = models.JSONField(default=dict, blank=True)
-    published_at = models.DateTimeField(blank=True, null=True)
-    scheduled_at = models.DateTimeField(blank=True, null=True, help_text="Schedule publish time")
-
-    class Meta:
-        ordering = ["-published_at", "-updated_at", "title"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "slug"], name="unique_site_post_slug"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.title}"
-
-
-class Comment(TimeStampedModel):
-    post = models.ForeignKey(Post, related_name="comments", on_delete=models.CASCADE)
-    author_name = models.CharField(max_length=140)
-    author_email = models.EmailField()
-    body = models.TextField()
-    is_approved = models.BooleanField(default=False)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def __str__(self) -> str:
-        return f"{self.post.title}: {self.author_name}"
-
-
-class FormSubmission(TimeStampedModel):
-    STATUS_NEW = "new"
-    STATUS_REVIEWED = "reviewed"
-    STATUS_ARCHIVED = "archived"
-    STATUS_CHOICES = [
-        (STATUS_NEW, "New"),
-        (STATUS_REVIEWED, "Reviewed"),
-        (STATUS_ARCHIVED, "Archived"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="form_submissions", on_delete=models.CASCADE)
-    page = models.ForeignKey(Page, related_name="form_submissions", on_delete=models.SET_NULL, null=True, blank=True)
-    form_name = models.CharField(max_length=140)
-    payload = models.JSONField(default=dict, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_NEW)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.form_name}"
-
-
-class Form(TimeStampedModel):
-    """Reusable form definition with field schema."""
-
-    STATUS_DRAFT = "draft"
-    STATUS_ACTIVE = "active"
-    STATUS_ARCHIVED = "archived"
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, "Draft"),
-        (STATUS_ACTIVE, "Active"),
-        (STATUS_ARCHIVED, "Archived"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="forms", on_delete=models.CASCADE)
-    name = models.CharField(max_length=140)
-    slug = models.SlugField(max_length=160)
-    description = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
-
-    # Form schema - list of field definitions
-    # Each field: {id, type, label, name, placeholder, required, options, validation}
-    fields = models.JSONField(default=list, blank=True)
-
-    # Form settings
-    submit_button_text = models.CharField(max_length=60, default="Submit")
-    success_message = models.TextField(default="Thank you for your submission!")
-    redirect_url = models.URLField(max_length=500, blank=True)
-    notify_emails = models.JSONField(default=list, blank=True)  # List of emails to notify
-
-    # Spam protection
-    enable_captcha = models.BooleanField(default=False)
-    honeypot_field = models.CharField(max_length=60, default="website")
-
-    # Styling
-    form_class = models.CharField(max_length=255, blank=True)
-    settings = models.JSONField(default=dict, blank=True)
-
-    class Meta:
-        ordering = ["name"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "slug"], name="unique_site_form_slug"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.name}"
-
-
 class BlockTemplate(TimeStampedModel):
     CATEGORY_HERO = "hero"
     CATEGORY_FEATURE = "feature"
@@ -1017,28 +555,6 @@ class DomainAvailability(models.Model):
         return f"{self.domain_name}: {status}"
 
 
-class SEOAnalytics(TimeStampedModel):
-    site = models.ForeignKey(Site, related_name="seo_analytics", on_delete=models.CASCADE)
-    page = models.ForeignKey(Page, related_name="seo_analytics", on_delete=models.CASCADE, null=True, blank=True)
-    date = models.DateField()
-    impressions = models.IntegerField(default=0)
-    clicks = models.IntegerField(default=0)
-    average_position = models.FloatField(default=0.0)
-    ctr = models.FloatField(default=0.0)
-    source = models.CharField(max_length=40, default="google_search_console")
-    metadata = models.JSONField(default=dict, blank=True)
-
-    class Meta:
-        ordering = ["-date"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "page", "date", "source"], name="unique_seo_analytics_entry"),
-        ]
-
-    def __str__(self) -> str:
-        page_name = self.page.title if self.page else "Site-wide"
-        return f"{self.site.name} - {page_name}: {self.date}"
-
-
 class MediaFolder(TimeStampedModel):
     site = models.ForeignKey(Site, related_name="media_folders", on_delete=models.CASCADE)
     name = models.CharField(max_length=140)
@@ -1122,250 +638,6 @@ class RobotsTxt(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.site.name}: robots.txt"
-
-
-class SearchConsoleCredential(TimeStampedModel):
-    """Stores encrypted OAuth2 tokens for Google Search Console per site."""
-
-    site = models.OneToOneField(Site, related_name="gsc_credential", on_delete=models.CASCADE)
-    property_url = models.CharField(max_length=500, blank=True)
-    access_token = models.TextField(blank=True)
-    refresh_token = models.TextField(blank=True)
-    token_expiry = models.DateTimeField(blank=True, null=True)
-    scopes = models.JSONField(default=list, blank=True)
-    last_synced_at = models.DateTimeField(blank=True, null=True)
-    sync_error = models.TextField(blank=True)
-
-    class Meta:
-        verbose_name = "Search Console Credential"
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: GSC ({self.property_url or 'unconfigured'})"
-
-
-class SEOAudit(TimeStampedModel):
-    """Technical SEO audit snapshot for a single page."""
-
-    STATUS_PENDING = "pending"
-    STATUS_RUNNING = "running"
-    STATUS_DONE = "done"
-    STATUS_ERROR = "error"
-    STATUS_CHOICES = [
-        (STATUS_PENDING, "Pending"),
-        (STATUS_RUNNING, "Running"),
-        (STATUS_DONE, "Done"),
-        (STATUS_ERROR, "Error"),
-    ]
-
-    site = models.ForeignKey(Site, related_name="seo_audits", on_delete=models.CASCADE)
-    page = models.ForeignKey(Page, related_name="seo_audits", on_delete=models.CASCADE, null=True, blank=True)
-    audited_url = models.URLField(max_length=1000, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    score = models.IntegerField(default=0)
-
-    # On-page checks
-    title = models.CharField(max_length=500, blank=True)
-    title_length = models.IntegerField(default=0)
-    meta_description = models.CharField(max_length=1000, blank=True)
-    meta_description_length = models.IntegerField(default=0)
-    h1_count = models.IntegerField(default=0)
-    h1_text = models.TextField(blank=True)
-    canonical_url = models.URLField(max_length=1000, blank=True)
-    og_title = models.CharField(max_length=500, blank=True)
-    og_description = models.CharField(max_length=1000, blank=True)
-    og_image = models.URLField(max_length=1000, blank=True)
-
-    # Technical checks
-    response_time_ms = models.IntegerField(default=0)
-    status_code = models.IntegerField(default=0)
-    word_count = models.IntegerField(default=0)
-    image_count = models.IntegerField(default=0)
-    images_missing_alt = models.IntegerField(default=0)
-    internal_links = models.IntegerField(default=0)
-    external_links = models.IntegerField(default=0)
-    has_schema_markup = models.BooleanField(default=False)
-    is_mobile_friendly = models.BooleanField(default=False)
-
-    issues = models.JSONField(default=list, blank=True)
-    error_message = models.TextField(blank=True)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def __str__(self) -> str:
-        label = self.page.title if self.page else self.audited_url
-        return f"{self.site.name}: {label} (score {self.score})"
-
-
-class TrackedKeyword(TimeStampedModel):
-    """A keyword the user wants to track rankings for."""
-
-    site = models.ForeignKey(Site, related_name="tracked_keywords", on_delete=models.CASCADE)
-    keyword = models.CharField(max_length=255)
-    target_url = models.CharField(max_length=1000, blank=True)
-    notes = models.TextField(blank=True)
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        ordering = ["keyword"]
-        constraints = [
-            models.UniqueConstraint(fields=["site", "keyword"], name="unique_site_keyword"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: {self.keyword}"
-
-
-class KeywordRankEntry(models.Model):
-    """A single rank data point for a tracked keyword."""
-
-    keyword = models.ForeignKey(TrackedKeyword, related_name="rank_entries", on_delete=models.CASCADE)
-    date = models.DateField()
-    position = models.FloatField(null=True, blank=True)
-    impressions = models.IntegerField(default=0)
-    clicks = models.IntegerField(default=0)
-    url = models.CharField(max_length=1000, blank=True)
-    source = models.CharField(max_length=40, default="manual")
-
-    class Meta:
-        ordering = ["-date"]
-        constraints = [
-            models.UniqueConstraint(fields=["keyword", "date", "source"], name="unique_keyword_rank_entry"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.keyword.keyword}: pos {self.position} on {self.date}"
-
-
-class SEOSettings(TimeStampedModel):
-    """Per-site SEO configuration."""
-
-    SCHEDULE_DAILY = "daily"
-    SCHEDULE_WEEKLY = "weekly"
-    SCHEDULE_MANUAL = "manual"
-    SCHEDULE_CHOICES = [
-        (SCHEDULE_DAILY, "Daily"),
-        (SCHEDULE_WEEKLY, "Weekly"),
-        (SCHEDULE_MANUAL, "Manual only"),
-    ]
-
-    site = models.OneToOneField(Site, related_name="seo_settings", on_delete=models.CASCADE)
-    audit_schedule = models.CharField(max_length=20, choices=SCHEDULE_CHOICES, default=SCHEDULE_MANUAL)
-    alert_score_threshold = models.IntegerField(default=60)
-    gsc_property_url = models.CharField(max_length=500, blank=True)
-    sitemap_url = models.CharField(max_length=1000, blank=True)
-    notify_on_issues = models.BooleanField(default=False)
-
-    class Meta:
-        verbose_name = "SEO Settings"
-        verbose_name_plural = "SEO Settings"
-
-    def __str__(self) -> str:
-        return f"{self.site.name}: SEO settings"
-
-
-# ---------------------------------------------------------------------------
-# Workspace / Team / Membership Models
-# ---------------------------------------------------------------------------
-
-class Workspace(TimeStampedModel):
-    """A workspace groups sites and members together for access control."""
-
-    name = models.CharField(max_length=140)
-    slug = models.SlugField(max_length=160, unique=True)
-    description = models.TextField(blank=True)
-    owner = models.ForeignKey(
-        "auth.User",
-        related_name="owned_workspaces",
-        on_delete=models.CASCADE,
-    )
-    settings = models.JSONField(default=dict, blank=True)
-    is_personal = models.BooleanField(default=False)
-
-    class Meta:
-        ordering = ["name"]
-
-    def __str__(self) -> str:
-        return self.name
-
-
-class WorkspaceMembership(TimeStampedModel):
-    """Membership linking users to workspaces with roles."""
-
-    ROLE_OWNER = "owner"
-    ROLE_ADMIN = "admin"
-    ROLE_EDITOR = "editor"
-    ROLE_VIEWER = "viewer"
-    ROLE_CHOICES = [
-        (ROLE_OWNER, "Owner"),
-        (ROLE_ADMIN, "Admin"),
-        (ROLE_EDITOR, "Editor"),
-        (ROLE_VIEWER, "Viewer"),
-    ]
-
-    workspace = models.ForeignKey(Workspace, related_name="memberships", on_delete=models.CASCADE)
-    user = models.ForeignKey("auth.User", related_name="workspace_memberships", on_delete=models.CASCADE)
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default=ROLE_VIEWER)
-    invited_by = models.ForeignKey(
-        "auth.User",
-        related_name="sent_invitations",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
-    invited_at = models.DateTimeField(auto_now_add=True)
-    accepted_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        ordering = ["role", "user__username"]
-        constraints = [
-            models.UniqueConstraint(fields=["workspace", "user"], name="unique_workspace_user"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.workspace.name}: {self.user.username} ({self.role})"
-
-    @property
-    def can_manage_members(self) -> bool:
-        return self.role in (self.ROLE_OWNER, self.ROLE_ADMIN)
-
-    @property
-    def can_edit_content(self) -> bool:
-        return self.role in (self.ROLE_OWNER, self.ROLE_ADMIN, self.ROLE_EDITOR)
-
-    @property
-    def can_view_content(self) -> bool:
-        return True  # All roles can view
-
-
-class WorkspaceInvitation(TimeStampedModel):
-    """Pending invitation to join a workspace."""
-
-    STATUS_PENDING = "pending"
-    STATUS_ACCEPTED = "accepted"
-    STATUS_DECLINED = "declined"
-    STATUS_EXPIRED = "expired"
-    STATUS_CHOICES = [
-        (STATUS_PENDING, "Pending"),
-        (STATUS_ACCEPTED, "Accepted"),
-        (STATUS_DECLINED, "Declined"),
-        (STATUS_EXPIRED, "Expired"),
-    ]
-
-    workspace = models.ForeignKey(Workspace, related_name="invitations", on_delete=models.CASCADE)
-    email = models.EmailField()
-    role = models.CharField(max_length=20, choices=WorkspaceMembership.ROLE_CHOICES, default=WorkspaceMembership.ROLE_EDITOR)
-    token = models.CharField(max_length=64, unique=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    invited_by = models.ForeignKey("auth.User", related_name="workspace_invitations", on_delete=models.CASCADE)
-    expires_at = models.DateTimeField()
-    accepted_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def __str__(self) -> str:
-        return f"{self.workspace.name}: {self.email} ({self.status})"
 
 
 # ---------------------------------------------------------------------------
@@ -1466,13 +738,13 @@ class EmailDomain(TimeStampedModel):
         SUSPENDED = 'suspended', 'Suspended'
 
     site = models.ForeignKey(
-        'Site',
+        Site,
         related_name='email_domains',
         on_delete=models.CASCADE,
         help_text='Site that owns this email domain',
     )
     workspace = models.ForeignKey(
-        'Workspace',
+        Workspace,
         related_name='email_domains',
         on_delete=models.CASCADE,
         help_text='Workspace that owns this domain',
@@ -1528,12 +800,12 @@ class Mailbox(TimeStampedModel):
     """Email mailbox within a domain."""
     
     workspace = models.ForeignKey(
-        'Workspace',
+        Workspace,
         related_name='mailboxes',
         on_delete=models.CASCADE,
     )
     site = models.ForeignKey(
-        'Site',
+        Site,
         related_name='mailboxes',
         on_delete=models.CASCADE,
     )
@@ -1588,12 +860,12 @@ class MailAlias(TimeStampedModel):
     """Email alias that forwards to a mailbox."""
     
     workspace = models.ForeignKey(
-        'Workspace',
+        Workspace,
         related_name='mail_aliases',
         on_delete=models.CASCADE,
     )
     site = models.ForeignKey(
-        'Site',
+        Site,
         related_name='mail_aliases',
         on_delete=models.CASCADE,
     )
@@ -1639,7 +911,7 @@ class EmailProvisioningTask(TimeStampedModel):
         FAILED = 'failed', 'Failed'
 
     workspace = models.ForeignKey(
-        'Workspace',
+        Workspace,
         related_name='email_provisioning_tasks',
         on_delete=models.CASCADE,
     )
@@ -1675,5 +947,4 @@ class EmailProvisioningTask(TimeStampedModel):
         return f"{self.task_type} ({self.status})"
 
 
-from .models_commerce_pro import DiscountCode, ShippingRate, ShippingZone, TaxRate  # noqa: E402
 from .models_platform_admin import PlatformEmailCampaign, PlatformOffer, PlatformSubscription  # noqa: E402
