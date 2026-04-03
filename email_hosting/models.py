@@ -71,6 +71,24 @@ class EmailDomain(TimeStampedModel):
         ordering = ["name"]
         unique_together = ("site", "name")
 
+    @property
+    def dkim_selector(self) -> str:
+        return "k1"
+
+    @property
+    def verification_txt_value(self) -> str:
+        return f"webbuilder-verify={self.verification_token}"
+
+    @property
+    def expected_dns_records(self) -> dict[str, str]:
+        return {
+            "mx": self.mx_record,
+            "spf": self.spf_record,
+            "dkim": self.dkim_record,
+            "dmarc": self.dmarc_record,
+            "ownership": self.verification_txt_value,
+        }
+
     def __str__(self) -> str:
         return f"{self.name} ({self.status})"
 

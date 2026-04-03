@@ -337,10 +337,67 @@ def provision_domain(domain: Domain, contact: DomainContact) -> None:
         raise
 
 
+def ensure_domain_portfolio_entry(site, domain_name: str, verification_token: str = "") -> Domain:
+    """Ensure a domain portfolio record exists for an email-hosting domain."""
+    normalized = domain_name.strip().lower().rstrip(".")
+    domain = Domain.objects.filter(domain_name=normalized).first()
+    if domain and domain.site_id != site.id:
+        raise RuntimeError("Domain already belongs to another site.")
+
+    if domain is None:
+        domain = Domain.objects.create(
+            site=site,
+            domain_name=normalized,
+            status=Domain.STATUS_PENDING,
+            verification_method=Domain.VERIFY_METHOD_DNS_TXT,
+            verification_token=verification_token[:100],
+            registration_status=Domain.REG_STATUS_UNREGISTERED,
+        )
+    else:
+        changed_fields: list[str] = []
+        if verification_token and domain.verification_token != verification_token[:100]:
+            domain.verification_token = verification_token[:100]
+            changed_fields.append("verification_token")
+        if domain.status == Domain.STATUS_FAILED:
+            domain.status = Domain.STATUS_PENDING
+            changed_fields.append("status")
+        if changed_fields:
+            domain.save(update_fields=[*changed_fields, "updated_at"])
+
+    mapping = DomainMapping.objects.filter(domain=normalized).first()
+    if mapping and mapping.site_id != site.id:
+        raise RuntimeError("Domain mapping already belongs to another site.")
+    if mapping is None:
+        DomainMapping.objects.create(
+            site=site,
+            domain=normalized,
+            is_primary=False,
+            status="pending",
+            dns_provider=(domain.registrar or "")[:50],
+            registrar=(domain.registrar or "")[:50],
+        )
+    return domain
+
+
+def mark_domain_verified_for_email(site, domain_name: str) -> None:
+    """Mark matching domain portfolio rows as verified after email DNS checks pass."""
+    normalized = domain_name.strip().lower().rstrip(".")
+    now = datetime.now(timezone.utc)
+    Domain.objects.filter(site=site, domain_name=normalized).update(
+        status=Domain.STATUS_VERIFIED,
+        verified_at=now,
+        verification_error="",
+        updated_at=now,
+    )
+    DomainMapping.objects.filter(site=site, domain=normalized).update(status="active")
+
+
 __all__ = [
     "check_domain_availability",
     "check_domain_availability_details",
+    "ensure_domain_portfolio_entry",
     "fetch_domain_whois",
+    "mark_domain_verified_for_email",
     "provision_domain",
     "verify_domain_ownership",
 ]

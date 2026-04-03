@@ -63,3 +63,48 @@ def verify_pending_email_domains() -> int:
             # Verification errors are tracked in service logs and task history.
             continue
     return processed
+
+
+@shared_task
+def provision_email_domain_task(email_domain_id: int, provisioning_task_id: int | None = None) -> dict:
+    """Provision a newly created email domain in the configured provider."""
+    domain = email_services.provision_email_domain(
+        email_domain_id,
+        provisioning_task_id=provisioning_task_id,
+        queue_verification=True,
+    )
+    return {"email_domain_id": domain.id, "domain": domain.name, "status": domain.status}
+
+
+@shared_task
+def verify_email_domain_task(email_domain_id: int, provisioning_task_id: int | None = None) -> dict:
+    """Run DNS readiness verification for one email domain."""
+    return email_services.verify_email_domain(email_domain_id, provisioning_task_id=provisioning_task_id)
+
+
+@shared_task
+def provision_mailbox_task(mailbox_id: int, provisioning_task_id: int | None = None) -> dict:
+    """Provision mailbox in provider backend."""
+    mailbox = email_services.provision_mailbox(mailbox_id, provisioning_task_id=provisioning_task_id)
+    return {"mailbox_id": mailbox.id, "email": mailbox.email_address}
+
+
+@shared_task
+def sync_mailbox_task(mailbox_id: int, provisioning_task_id: int | None = None) -> dict:
+    """Sync mailbox active/password state with provider backend."""
+    mailbox = email_services.sync_mailbox(mailbox_id, provisioning_task_id=provisioning_task_id)
+    return {"mailbox_id": mailbox.id, "email": mailbox.email_address, "is_active": mailbox.is_active}
+
+
+@shared_task
+def provision_alias_task(alias_id: int, provisioning_task_id: int | None = None) -> dict:
+    """Provision alias forwarding in provider backend."""
+    alias = email_services.provision_alias(alias_id, provisioning_task_id=provisioning_task_id)
+    return {"alias_id": alias.id, "source": alias.source_address}
+
+
+@shared_task
+def sync_alias_task(alias_id: int, provisioning_task_id: int | None = None) -> dict:
+    """Sync alias active state with provider backend."""
+    alias = email_services.sync_alias(alias_id, provisioning_task_id=provisioning_task_id)
+    return {"alias_id": alias.id, "source": alias.source_address, "active": alias.active}

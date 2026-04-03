@@ -519,6 +519,33 @@ DEFAULT_FROM_EMAIL = env_str("DJANGO_DEFAULT_FROM_EMAIL", "noreply@smcwebbuilder
 SERVER_EMAIL = env_str("DJANGO_SERVER_EMAIL", DEFAULT_FROM_EMAIL)
 
 # ---------------------------------------------------------------------------
+# Email Hosting Provider Configuration
+# ---------------------------------------------------------------------------
+EMAIL_HOSTING_PROVIDER = env_str("EMAIL_HOSTING_PROVIDER", "local").lower()
+EMAIL_HOSTING_API_BASE_URL = env_str("EMAIL_HOSTING_API_BASE_URL")
+EMAIL_HOSTING_API_TOKEN = env_str("EMAIL_HOSTING_API_TOKEN")
+EMAIL_HOSTING_API_TIMEOUT = int(env_str("EMAIL_HOSTING_API_TIMEOUT", "20"))
+EMAIL_HOSTING_DNS_TIMEOUT = int(env_str("EMAIL_HOSTING_DNS_TIMEOUT", "8"))
+EMAIL_HOSTING_DKIM_SELECTOR = env_str("EMAIL_HOSTING_DKIM_SELECTOR", "k1")
+EMAIL_HOSTING_DKIM_PUBLIC_KEY = env_str("EMAIL_HOSTING_DKIM_PUBLIC_KEY")
+EMAIL_HOSTING_MX_HOST = env_str("EMAIL_HOSTING_MX_HOST", "mail.{domain}")
+EMAIL_HOSTING_SPF_TEMPLATE = env_str("EMAIL_HOSTING_SPF_TEMPLATE", "v=spf1 mx include:{domain} ~all")
+EMAIL_HOSTING_DMARC_TEMPLATE = env_str(
+    "EMAIL_HOSTING_DMARC_TEMPLATE",
+    "v=DMARC1; p=quarantine; rua=mailto:dmarc@{domain}",
+)
+EMAIL_HOSTING_REQUIRE_ACTIVE_DOMAIN = env_bool("EMAIL_HOSTING_REQUIRE_ACTIVE_DOMAIN", True)
+
+if EMAIL_HOSTING_PROVIDER not in {"local", "api"}:
+    raise ImproperlyConfigured("EMAIL_HOSTING_PROVIDER must be either 'local' or 'api'.")
+if EMAIL_HOSTING_PROVIDER == "api":
+    if not EMAIL_HOSTING_API_BASE_URL:
+        raise ImproperlyConfigured("EMAIL_HOSTING_API_BASE_URL must be set when EMAIL_HOSTING_PROVIDER=api.")
+    if not EMAIL_HOSTING_API_TOKEN:
+        raise ImproperlyConfigured("EMAIL_HOSTING_API_TOKEN must be set when EMAIL_HOSTING_PROVIDER=api.")
+    _ensure_not_placeholder("EMAIL_HOSTING_API_TOKEN", EMAIL_HOSTING_API_TOKEN)
+
+# ---------------------------------------------------------------------------
 # Production Media Storage (S3-compatible)
 # ---------------------------------------------------------------------------
 USE_S3_STORAGE = env_bool("DJANGO_USE_S3_STORAGE", False)
