@@ -1,0 +1,3 @@
+# After adding payment models and services, run migrations:
+python manage.py makemigrations payments
+python manage.py migrate

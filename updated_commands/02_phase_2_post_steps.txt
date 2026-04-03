@@ -1,0 +1,3 @@
+# After applying the patches, run the following commands to generate migrations:
+python manage.py makemigrations cms domains notifications jobs email_hosting
+python manage.py migrate

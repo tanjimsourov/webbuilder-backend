@@ -1,7 +1,21 @@
-"""Jobs domain serializers.
+"""Jobs domain serializers."""
 
-No job serializers have been split out yet; this file is the app-level surface
-for the upcoming migration.
-"""
+from __future__ import annotations
 
-__all__: list[str] = []
+from rest_framework import serializers
+
+from jobs.models import Job
+
+
+class JobSerializer(serializers.ModelSerializer):
+    """Read serializer for background jobs."""
+
+    class Meta:
+        model = Job
+        fields = "__all__"
+        read_only_fields = "__all__"
+
+
+__all__ = [
+    "JobSerializer",
+]

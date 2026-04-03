@@ -323,6 +323,7 @@ INSTALLED_APPS = [
     "analytics",
     "notifications",
     "jobs",
+    "email_hosting",
     # Payments and billing
     "payments",
     # Domain provisioning

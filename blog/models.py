@@ -53,7 +53,7 @@ class Post(TimeStampedModel):
     body_html = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     featured_media = models.ForeignKey(
-        "builder.MediaAsset",
+        "cms.MediaAsset",
         related_name="featured_posts",
         on_delete=models.SET_NULL,
         null=True,

@@ -1,6 +1,13 @@
-"""Notifications domain views (transitional exports)."""
+"""Notifications domain view wrappers.
 
-from builder.email_views import (  # noqa: F401
+Email hosting views are re-exported here for backwards compatibility with
+existing URL imports.
+"""
+
+from __future__ import annotations
+
+from builder.views import WebhookViewSet as BuilderWebhookViewSet
+from email_hosting.views import (
     EmailDomainCreateView,
     EmailDomainViewSet,
     EmailProvisioningTaskViewSet,
@@ -8,7 +15,11 @@ from builder.email_views import (  # noqa: F401
     MailboxCreateView,
     MailboxViewSet,
 )
-from builder.views import WebhookViewSet  # noqa: F401
+
+
+class WebhookViewSet(BuilderWebhookViewSet):
+    """Webhook configuration endpoints."""
+
 
 __all__ = [
     "EmailDomainCreateView",

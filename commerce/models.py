@@ -44,7 +44,7 @@ class Product(TimeStampedModel):
     description_html = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     featured_media = models.ForeignKey(
-        "builder.MediaAsset",
+        "cms.MediaAsset",
         related_name="product_featured_for",
         on_delete=models.SET_NULL,
         null=True,

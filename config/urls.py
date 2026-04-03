@@ -18,6 +18,7 @@ from builder.views import (
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/payments/", include(("payments.urls", "payments"), namespace="payments")),
     path("api/", include("builder.urls")),
     path("preview/<slug:site_slug>/feed.xml", SiteBlogFeed(), name="preview-blog-feed"),
     path("preview/<slug:site_slug>/sitemap.xml", public_sitemap, name="preview-sitemap"),

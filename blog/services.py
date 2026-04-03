@@ -1,7 +1,17 @@
-"""Blog domain service exports."""
+"""Blog domain service wrappers."""
 
-from builder.services import preview_url_for_post  # noqa: F401
+from __future__ import annotations
+
+from typing import Any
+
+from builder import services as builder_services
+
+
+def post_preview_url(post: Any) -> str:
+    """Return the preview URL for a blog post."""
+    return builder_services.preview_url_for_post(post)
+
 
 __all__ = [
-    "preview_url_for_post",
+    "post_preview_url",
 ]

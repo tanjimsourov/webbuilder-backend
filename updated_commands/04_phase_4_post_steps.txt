@@ -1,0 +1,4 @@
+# After installing Celery and Redis, run migrations and start the worker:
+python manage.py makemigrations jobs
+python manage.py migrate
+celery -A config worker -l info

@@ -1,6 +1,20 @@
-"""Jobs domain views.
+"""Jobs domain views."""
 
-Job API views are still hosted in ``builder`` for now.
-"""
+from __future__ import annotations
 
-__all__: list[str] = []
+from rest_framework import mixins, viewsets
+
+from jobs.models import Job
+from jobs.serializers import JobSerializer
+
+
+class JobViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    """Read-only job endpoints."""
+
+    queryset = Job.objects.all().order_by("-priority", "scheduled_at")
+    serializer_class = JobSerializer
+
+
+__all__ = [
+    "JobViewSet",
+]

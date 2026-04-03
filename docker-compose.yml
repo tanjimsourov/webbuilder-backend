@@ -10,6 +10,8 @@ services:
       - "8000:8000"
     volumes:
       - ./media:/app/media
+    depends_on:
+      - redis
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=10)"]
@@ -30,9 +32,8 @@ services:
     build: .
     env_file:
       - .env
-    command: celery -A config worker --loglevel=info
+    command: celery -A config worker -l info
     depends_on:
-      - backend
       - redis
     volumes:
       - ./media:/app/media
