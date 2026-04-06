@@ -18,6 +18,8 @@ from django.db import transaction
 from django.utils.html import strip_tags
 from django.utils.text import slugify
 
+from cms.page_schema import normalize_page_content
+
 from .app_registry import platform_app_registry
 from .models import Page
 from .search_services import search_service
@@ -925,15 +927,41 @@ def apply_site_blueprint(*, site, blueprint: dict[str, Any], sync_navigation: bo
             continue
 
         html, css = build_page_markup_from_blueprint(page_plan, normalized_blueprint)
-        page = Page.objects.create(
-            site=site,
+        canonical_builder_data = {
+            "metadata": {
+                "description": page_plan.get("purpose", ""),
+            },
+            "sections": page_plan.get("sections") or [],
+            "layout": page_plan.get("layout") or {},
+        }
+        normalized_payload = normalize_page_content(
             title=page_plan["title"],
             slug=page_plan["slug"],
             path=page_plan["path"],
             is_homepage=page_plan["is_homepage"],
+            status=Page.STATUS_DRAFT,
+            locale_code="",
+            builder_data=canonical_builder_data,
             seo=page_plan["seo"],
+            page_settings={},
             html=html,
             css=css,
+            js="",
+            strict=True,
+        )
+        page = Page.objects.create(
+            site=site,
+            title=page_plan["title"],
+            slug=normalized_payload["slug"],
+            path=normalized_payload["path"],
+            is_homepage=page_plan["is_homepage"],
+            seo=normalized_payload["seo"],
+            page_settings=normalized_payload["page_settings"],
+            builder_schema_version=normalized_payload["schema_version"],
+            builder_data=normalized_payload["builder_data"],
+            html=normalized_payload["html"],
+            css=normalized_payload["css"],
+            js=normalized_payload["js"],
         )
         sync_homepage_state(page)
         ensure_unique_page_path(page)

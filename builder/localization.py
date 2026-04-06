@@ -4,6 +4,7 @@ from typing import Iterable
 from django.db import transaction
 from django.utils.text import slugify
 
+from cms.page_schema import normalize_page_content
 
 LOCALE_CODE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 RTL_LANGUAGE_CODES = {"ar", "fa", "he", "ku", "ps", "sd", "ug", "ur"}
@@ -77,6 +78,7 @@ def clone_page_translation_content(page, locale):
             "path": normalize_translation_path(page.slug, page.is_homepage),
             "seo": page.seo or {},
             "page_settings": page.page_settings or {},
+            "builder_schema_version": page.builder_schema_version,
             "builder_data": page.builder_data or {},
             "html": page.html or "",
             "css": page.css or "",
@@ -173,6 +175,10 @@ def build_translation_payload(translation, payload: dict) -> None:
         translation.seo = payload["seo"] or {}
     if "page_settings" in payload:
         translation.page_settings = payload["page_settings"] or {}
+    if "builder_schema_version" in payload:
+        translation.builder_schema_version = payload["builder_schema_version"]
+    if "builder_data" in payload:
+        translation.builder_data = payload["builder_data"] or {}
     if "project_data" in payload:
         translation.builder_data = payload["project_data"] or {}
     if "html" in payload:
@@ -181,3 +187,30 @@ def build_translation_payload(translation, payload: dict) -> None:
         translation.css = payload["css"] or ""
     if "js" in payload:
         translation.js = payload["js"] or ""
+
+    strict_schema_validation = any(
+        key in payload for key in ("builder_data", "project_data", "seo", "page_settings", "builder_schema_version")
+    )
+    normalized = normalize_page_content(
+        title=translation.title,
+        slug=translation.slug,
+        path=translation.path,
+        is_homepage=translation.page.is_homepage,
+        status=translation.status,
+        locale_code=translation.locale.code if translation.locale_id else "",
+        builder_data=translation.builder_data,
+        seo=translation.seo,
+        page_settings=translation.page_settings,
+        html=translation.html,
+        css=translation.css,
+        js=translation.js,
+        schema_version=translation.builder_schema_version,
+        strict=strict_schema_validation,
+    )
+    translation.builder_schema_version = normalized["schema_version"]
+    translation.builder_data = normalized["builder_data"]
+    translation.seo = normalized["seo"]
+    translation.page_settings = normalized["page_settings"]
+    translation.html = normalized["html"]
+    translation.css = normalized["css"]
+    translation.js = normalized["js"]

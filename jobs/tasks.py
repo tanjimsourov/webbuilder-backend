@@ -1,7 +1,5 @@
 """Celery tasks for background processing."""
 
-from datetime import datetime, timezone
-
 from celery import shared_task
 
 from cms import services as cms_services
@@ -13,15 +11,20 @@ from email_hosting.models import EmailDomain
 def publish_scheduled_pages() -> None:
     """Publish pages scheduled to go live.
 
-    This placeholder keeps the periodic task surface in the jobs domain.
-    Once the page lifecycle is fully migrated, replace this with an ORM query
-    and call into ``cms.services`` for each due page.
+    Delegates to CMS service-owned scheduling logic to keep behavior consistent
+    between manual jobs and periodic execution.
     """
-    now = datetime.now(timezone.utc)
-    # TODO: for page in Page.objects.filter(status=Page.STATUS_DRAFT, scheduled_at__lte=now):
-    #     cms_services.publish_page(page)
-    _ = (now, cms_services)
+    cms_services.publish_due_pages()
     return None
+
+
+@shared_task(bind=True, max_retries=5, default_retry_delay=60)
+def runtime_revalidate(self, payload: dict | None = None) -> dict:
+    """Execute a Next.js runtime revalidation call with retries."""
+    try:
+        return cms_services.process_runtime_revalidation_job(payload or {})
+    except Exception as exc:
+        raise self.retry(exc=exc)
 
 
 @shared_task

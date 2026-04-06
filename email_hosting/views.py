@@ -10,8 +10,8 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from builder.views import SitePermissionMixin
 from builder.workspace_views import check_site_permission, get_user_workspaces
+from core.views import SitePermissionMixin
 from core.models import Site
 from email_hosting import services as email_services
 from email_hosting.models import EmailDomain, EmailProvisioningTask, MailAlias, Mailbox

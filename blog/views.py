@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from blog.models import Post
+from blog.serializers import PublicRuntimePostSerializer
+from cms.services import public_site_capabilities
 from builder.views import (
     CommentViewSet as BuilderCommentViewSet,
     PostCategoryViewSet as BuilderPostCategoryViewSet,
@@ -12,22 +22,89 @@ from builder.views import (
     public_blog_index,
     public_blog_post,
 )
+from core.views import PublicRuntimeSiteMixin
 
 
-class PostViewSet(BuilderPostViewSet):
-    """Blog post endpoints."""
+PostViewSet = BuilderPostViewSet
+PostCategoryViewSet = BuilderPostCategoryViewSet
+PostTagViewSet = BuilderPostTagViewSet
+CommentViewSet = BuilderCommentViewSet
 
 
-class PostCategoryViewSet(BuilderPostCategoryViewSet):
-    """Blog category endpoints."""
+class PublicRuntimeBlogPostsView(PublicRuntimeSiteMixin, APIView):
+    """Published blog listing endpoint for headless runtime consumption."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        site, _ = self.resolve_public_site(request)
+        capabilities = public_site_capabilities(site)
+        if not capabilities.get("blog_enabled", False):
+            return Response({"site": {"id": site.id, "slug": site.slug}, "results": []})
+
+        now = timezone.now()
+        queryset = (
+            site.posts.select_related("featured_media")
+            .prefetch_related("categories", "tags")
+            .filter(status=Post.STATUS_PUBLISHED)
+            .filter(Q(published_at__isnull=True) | Q(published_at__lte=now))
+            .order_by("-published_at", "-updated_at")
+        )
+
+        category = (request.query_params.get("category") or "").strip()
+        tag = (request.query_params.get("tag") or "").strip()
+        query = (request.query_params.get("q") or "").strip()
+        if category:
+            queryset = queryset.filter(categories__slug=category)
+        if tag:
+            queryset = queryset.filter(tags__slug=tag)
+        if query:
+            queryset = queryset.filter(Q(title__icontains=query) | Q(excerpt__icontains=query) | Q(body_html__icontains=query))
+
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", 20)), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        posts = list(queryset[:limit])
+        serializer = PublicRuntimePostSerializer(posts, many=True, context={"request": request})
+        return Response(
+            {
+                "site": {"id": site.id, "slug": site.slug},
+                "count": len(posts),
+                "results": serializer.data,
+            }
+        )
 
 
-class PostTagViewSet(BuilderPostTagViewSet):
-    """Blog tag endpoints."""
+class PublicRuntimeBlogPostDetailView(PublicRuntimeSiteMixin, APIView):
+    """Single published blog post endpoint for headless runtime rendering."""
 
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
 
-class CommentViewSet(BuilderCommentViewSet):
-    """Blog comment moderation endpoints."""
+    def get(self, request, post_slug: str):
+        site, _ = self.resolve_public_site(request)
+        capabilities = public_site_capabilities(site)
+        if not capabilities.get("blog_enabled", False):
+            return Response({"detail": "Blog is disabled for this site."}, status=404)
+
+        now = timezone.now()
+        post = get_object_or_404(
+            site.posts.select_related("featured_media").prefetch_related("categories", "tags"),
+            slug=post_slug,
+            status=Post.STATUS_PUBLISHED,
+        )
+        if post.published_at and post.published_at > now:
+            return Response({"detail": "Published post not found."}, status=404)
+
+        serializer = PublicRuntimePostSerializer(post, context={"request": request})
+        return Response(
+            {
+                "site": {"id": site.id, "slug": site.slug},
+                "post": serializer.data,
+            }
+        )
 
 
 __all__ = [
@@ -36,6 +113,8 @@ __all__ = [
     "PostTagViewSet",
     "PostViewSet",
     "PublicCommentSubmissionView",
+    "PublicRuntimeBlogPostDetailView",
+    "PublicRuntimeBlogPostsView",
     "SiteBlogFeed",
     "public_blog_index",
     "public_blog_post",

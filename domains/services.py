@@ -12,6 +12,7 @@ import logging
 import shutil
 import ssl
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -19,12 +20,152 @@ from typing import Any
 from xml.etree import ElementTree
 
 from django.conf import settings
+from django.http import HttpRequest
 from django.utils.dateparse import parse_date, parse_datetime
 
 from builder import domain_services as builder_domain_services
+from core.models import Site
 from domains.models import Domain, DomainAvailability, DomainContact, DomainMapping, SSLCertificate
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DomainRuntimeResolution:
+    """Host-to-site resolution result for public runtime requests."""
+
+    site: Site
+    requested_host: str
+    matched_domain: str
+    canonical_domain: str
+    source: str
+    is_primary: bool
+
+
+def normalize_runtime_host(host: str | None) -> str:
+    """Normalize request host/domain values before DB lookups."""
+    normalized = (host or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        from urllib.parse import urlsplit
+
+        normalized = (urlsplit(normalized).hostname or "").strip().lower()
+    if ":" in normalized and not normalized.startswith("["):
+        normalized = normalized.split(":", 1)[0].strip()
+    return normalized.rstrip(".")
+
+
+def host_from_request(request: HttpRequest) -> str:
+    """Return a normalized host for runtime resolution."""
+    raw_host = ""
+    try:
+        raw_host = request.get_host()
+    except Exception:  # pragma: no cover - DisallowedHost and similar are normalized to empty.
+        raw_host = request.META.get("HTTP_HOST", "")
+    return normalize_runtime_host(raw_host)
+
+
+def _host_alias_candidates(host: str) -> list[str]:
+    if not host:
+        return []
+    if host.startswith("www."):
+        return [host, host[4:]]
+    return [host, f"www.{host}"]
+
+
+def _active_domain_mapping_for_host(host: str) -> DomainMapping | None:
+    return (
+        DomainMapping.objects.select_related("site")
+        .filter(domain__iexact=host, status__iexact=DomainMapping.STATUS_ACTIVE)
+        .order_by("-is_primary", "domain")
+        .first()
+    )
+
+
+def _verified_domain_for_host(host: str) -> Domain | None:
+    return (
+        Domain.objects.select_related("site")
+        .filter(domain_name__iexact=host, status=Domain.STATUS_VERIFIED)
+        .order_by("-is_primary", "domain_name")
+        .first()
+    )
+
+
+def primary_public_domain_for_site(site: Site) -> str:
+    """Return the best canonical public domain for a site."""
+    mapping = (
+        DomainMapping.objects.filter(site=site, status__iexact=DomainMapping.STATUS_ACTIVE, is_primary=True)
+        .order_by("domain")
+        .first()
+    )
+    if mapping:
+        return mapping.domain
+    fallback_mapping = (
+        DomainMapping.objects.filter(site=site, status__iexact=DomainMapping.STATUS_ACTIVE).order_by("domain").first()
+    )
+    if fallback_mapping:
+        return fallback_mapping.domain
+    if (site.domain or "").strip():
+        return site.domain.strip().lower()
+    verified_domain = (
+        Domain.objects.filter(site=site, status=Domain.STATUS_VERIFIED)
+        .order_by("-is_primary", "domain_name")
+        .first()
+    )
+    return verified_domain.domain_name if verified_domain else ""
+
+
+def resolve_site_for_host(host: str | None) -> DomainRuntimeResolution | None:
+    """
+    Resolve a public site by host/domain.
+
+    Resolution order:
+    1. Active `DomainMapping` entries.
+    2. Verified `Domain` portfolio rows.
+    3. Legacy `Site.domain` fallback.
+    """
+    normalized = normalize_runtime_host(host)
+    if not normalized:
+        return None
+
+    for candidate in _host_alias_candidates(normalized):
+        mapping = _active_domain_mapping_for_host(candidate)
+        if mapping:
+            canonical = primary_public_domain_for_site(mapping.site) or mapping.domain
+            return DomainRuntimeResolution(
+                site=mapping.site,
+                requested_host=normalized,
+                matched_domain=mapping.domain,
+                canonical_domain=canonical,
+                source="domain_mapping",
+                is_primary=bool(mapping.is_primary),
+            )
+
+        verified_domain = _verified_domain_for_host(candidate)
+        if verified_domain:
+            canonical = primary_public_domain_for_site(verified_domain.site) or verified_domain.domain_name
+            return DomainRuntimeResolution(
+                site=verified_domain.site,
+                requested_host=normalized,
+                matched_domain=verified_domain.domain_name,
+                canonical_domain=canonical,
+                source="domain_portfolio",
+                is_primary=bool(verified_domain.is_primary),
+            )
+
+        legacy_site = Site.objects.filter(domain__iexact=candidate).first()
+        if legacy_site:
+            canonical = primary_public_domain_for_site(legacy_site) or candidate
+            return DomainRuntimeResolution(
+                site=legacy_site,
+                requested_host=normalized,
+                matched_domain=candidate,
+                canonical_domain=canonical,
+                source="site.domain",
+                is_primary=True,
+            )
+    return None
 
 
 def _parse_decimal(value: Any) -> Decimal | None:
@@ -203,13 +344,13 @@ def _store_ssl_certificate(domain: Domain, cert_pem: str, key_pem: str, expires_
         domain=domain.domain_name,
         defaults={
             "is_primary": domain.is_primary,
-            "status": "active",
+            "status": DomainMapping.STATUS_ACTIVE,
             "dns_provider": "namecheap",
             "registrar": (domain.registrar or "namecheap")[:50],
         },
     )
-    if mapping.status != "active":
-        mapping.status = "active"
+    if mapping.status != DomainMapping.STATUS_ACTIVE:
+        mapping.status = DomainMapping.STATUS_ACTIVE
         mapping.save(update_fields=["status", "updated_at"])
 
     SSLCertificate.objects.update_or_create(
@@ -372,7 +513,7 @@ def ensure_domain_portfolio_entry(site, domain_name: str, verification_token: st
             site=site,
             domain=normalized,
             is_primary=False,
-            status="pending",
+            status=DomainMapping.STATUS_PENDING,
             dns_provider=(domain.registrar or "")[:50],
             registrar=(domain.registrar or "")[:50],
         )
@@ -389,15 +530,20 @@ def mark_domain_verified_for_email(site, domain_name: str) -> None:
         verification_error="",
         updated_at=now,
     )
-    DomainMapping.objects.filter(site=site, domain=normalized).update(status="active")
+    DomainMapping.objects.filter(site=site, domain=normalized).update(status=DomainMapping.STATUS_ACTIVE)
 
 
 __all__ = [
+    "DomainRuntimeResolution",
     "check_domain_availability",
     "check_domain_availability_details",
     "ensure_domain_portfolio_entry",
     "fetch_domain_whois",
+    "host_from_request",
     "mark_domain_verified_for_email",
+    "normalize_runtime_host",
+    "primary_public_domain_for_site",
     "provision_domain",
+    "resolve_site_for_host",
     "verify_domain_ownership",
 ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.db import models
 
 from core.models import Site, SiteLocale, TimeStampedModel
+from cms.page_schema import PAGE_SCHEMA_VERSION
 
 
 class Page(TimeStampedModel):
@@ -21,6 +22,7 @@ class Page(TimeStampedModel):
     is_homepage = models.BooleanField(default=False)
     seo = models.JSONField(default=dict, blank=True)
     page_settings = models.JSONField(default=dict, blank=True)
+    builder_schema_version = models.PositiveSmallIntegerField(default=PAGE_SCHEMA_VERSION)
     builder_data = models.JSONField(default=dict, blank=True)
     html = models.TextField(blank=True)
     css = models.TextField(blank=True)
@@ -36,6 +38,14 @@ class Page(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.site.name}: {self.title}"
+
+    @property
+    def is_published(self) -> bool:
+        return self.status == self.STATUS_PUBLISHED
+
+    @property
+    def is_scheduled(self) -> bool:
+        return self.scheduled_at is not None
 
 
 class PageTranslation(TimeStampedModel):
@@ -54,6 +64,7 @@ class PageTranslation(TimeStampedModel):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     seo = models.JSONField(default=dict, blank=True)
     page_settings = models.JSONField(default=dict, blank=True)
+    builder_schema_version = models.PositiveSmallIntegerField(default=PAGE_SCHEMA_VERSION)
     builder_data = models.JSONField(default=dict, blank=True)
     html = models.TextField(blank=True)
     css = models.TextField(blank=True)
@@ -69,6 +80,10 @@ class PageTranslation(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.page.title} [{self.locale.code}]"
+
+    @property
+    def is_published(self) -> bool:
+        return self.status == self.STATUS_PUBLISHED
 
 
 class MediaAsset(TimeStampedModel):
@@ -166,6 +181,25 @@ class BlockTemplate(TimeStampedModel):
     site = models.ForeignKey(Site, related_name="block_templates", on_delete=models.CASCADE, null=True, blank=True)
     name = models.CharField(max_length=180)
     category = models.CharField(max_length=40, choices=CATEGORY_CHOICES, default=CATEGORY_OTHER)
+    renderer_key = models.CharField(
+        max_length=120,
+        default="core.rich-text",
+        help_text="Stable Next.js component registry key used to render this template.",
+    )
+    default_props_schema = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Default props contract passed to the runtime component.",
+    )
+    version = models.PositiveSmallIntegerField(
+        default=1,
+        help_text="Template contract version for renderer compatibility checks.",
+    )
+    compatibility_flags = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Runtime compatibility toggles (for example, requires_blog, requires_commerce).",
+    )
     description = models.TextField(blank=True)
     thumbnail_url = models.URLField(blank=True)
     builder_data = models.JSONField(default=dict, blank=True)

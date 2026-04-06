@@ -8,10 +8,21 @@ from core.models import Site, TimeStampedModel
 
 
 class DomainMapping(TimeStampedModel):
+    STATUS_PENDING = "pending"
+    STATUS_ACTIVE = "active"
+    STATUS_INACTIVE = "inactive"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_INACTIVE, "Inactive"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
     site = models.ForeignKey(Site, related_name="domain_mappings", on_delete=models.CASCADE)
     domain = models.CharField(max_length=255, unique=True)
     is_primary = models.BooleanField(default=False)
-    status = models.CharField(max_length=30, default="pending")
+    status = models.CharField(max_length=30, default=STATUS_PENDING)
     dns_provider = models.CharField(max_length=50, blank=True)
     registrar = models.CharField(max_length=50, blank=True)
 
@@ -20,6 +31,10 @@ class DomainMapping(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.site.slug} -> {self.domain} ({self.status})"
+
+    @property
+    def is_public_active(self) -> bool:
+        return (self.status or "").strip().lower() == self.STATUS_ACTIVE
 
 
 class SSLCertificate(TimeStampedModel):

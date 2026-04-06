@@ -17,8 +17,7 @@ from email_hosting.views import (
 )
 
 
-class WebhookViewSet(BuilderWebhookViewSet):
-    """Webhook configuration endpoints."""
+WebhookViewSet = BuilderWebhookViewSet
 
 
 __all__ = [

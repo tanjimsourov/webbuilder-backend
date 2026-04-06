@@ -22,6 +22,7 @@ from datetime import timedelta
 from typing import Any, Callable
 
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from .models import Job, WebhookDelivery
 
@@ -92,6 +93,7 @@ def schedule_publish(
         payload={
             "content_type": content_type,
             "content_id": content_id,
+            "publish_at": publish_at.isoformat(),
         },
         scheduled_at=publish_at,
         idempotency_key=f"{content_type}:{content_id}:{publish_at.isoformat()}",
@@ -135,15 +137,63 @@ def handle_publish_content(job: Job) -> dict:
     """Publish scheduled content."""
     from .models import Page, Post, Product
 
+    def _ensure_aware(dt):
+        if dt is None:
+            return None
+        if timezone.is_naive(dt):
+            return timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt
+
+    def _job_publish_at():
+        raw = job.payload.get("publish_at")
+        if not raw:
+            return None
+        parsed = parse_datetime(str(raw))
+        if parsed is None:
+            return None
+        return _ensure_aware(parsed)
+
     content_type = job.payload.get("content_type")
     content_id = job.payload.get("content_id")
+    job_publish_at = _job_publish_at()
 
-    model_map = {
-        "page": Page,
-        "post": Post,
-        "product": Product,
-    }
+    if content_type == "page":
+        from cms.services import publish_page_content
 
+        try:
+            page = Page.objects.select_related("site").get(pk=content_id)
+        except Page.DoesNotExist:
+            return {"error": f"page {content_id} not found"}
+        page_scheduled_at = _ensure_aware(page.scheduled_at)
+
+        # Protect against stale jobs when a page is rescheduled after the old job was created.
+        if page_scheduled_at and job_publish_at:
+            if abs((page_scheduled_at - job_publish_at).total_seconds()) > 1:
+                return {
+                    "skipped": True,
+                    "reason": "Stale scheduled publish job",
+                    "scheduled_at": page_scheduled_at.isoformat(),
+                    "job_publish_at": job_publish_at.isoformat(),
+                }
+
+        if page_scheduled_at and page_scheduled_at > timezone.now():
+            return {
+                "skipped": True,
+                "reason": "Scheduled time not reached",
+                "scheduled_at": page_scheduled_at.isoformat(),
+            }
+
+        if page.status == Page.STATUS_PUBLISHED:
+            return {"skipped": True, "reason": "Already published"}
+        result = publish_page_content(page, actor="job_queue", reason="scheduled_publish")
+        return {
+            "published": True,
+            "content_type": "page",
+            "content_id": page.id,
+            "revalidation_paths": result.get("routes", []),
+        }
+
+    model_map = {"post": Post, "product": Product}
     model = model_map.get(content_type)
     if not model:
         return {"error": f"Unknown content type: {content_type}"}
@@ -153,25 +203,52 @@ def handle_publish_content(job: Job) -> dict:
     except model.DoesNotExist:
         return {"error": f"{content_type} {content_id} not found"}
 
-    # Check if already published
+    content_scheduled_at = _ensure_aware(getattr(content, "scheduled_at", None))
+    if content_scheduled_at and job_publish_at:
+        if abs((content_scheduled_at - job_publish_at).total_seconds()) > 1:
+            return {
+                "skipped": True,
+                "reason": "Stale scheduled publish job",
+                "scheduled_at": content_scheduled_at.isoformat(),
+                "job_publish_at": job_publish_at.isoformat(),
+            }
+
+    if content_scheduled_at and content_scheduled_at > timezone.now():
+        return {
+            "skipped": True,
+            "reason": "Scheduled time not reached",
+            "scheduled_at": content_scheduled_at.isoformat(),
+        }
+
     if content.status == "published":
         return {"skipped": True, "reason": "Already published"}
 
-    # Publish
     content.status = "published"
     content.published_at = timezone.now()
     content.save(update_fields=["status", "published_at", "updated_at"])
 
-    # Trigger webhook
     from .services import trigger_webhooks
+
     event = f"{content_type}.published"
-    trigger_webhooks(content.site, event, {
-        f"{content_type}_id": content.id,
-        "title": content.title,
-        "slug": getattr(content, "slug", ""),
-    })
+    trigger_webhooks(
+        content.site,
+        event,
+        {
+            f"{content_type}_id": content.id,
+            "title": content.title,
+            "slug": getattr(content, "slug", ""),
+        },
+    )
 
     return {"published": True, "content_type": content_type, "content_id": content_id}
+
+
+@register_job("runtime_revalidate")
+def handle_runtime_revalidate(job: Job) -> dict:
+    """Run Next.js runtime revalidation for queued route payloads."""
+    from cms.services import process_runtime_revalidation_job
+
+    return process_runtime_revalidation_job(job.payload)
 
 
 @register_job("deliver_webhook")

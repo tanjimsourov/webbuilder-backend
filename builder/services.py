@@ -8,6 +8,12 @@ from django.conf import settings
 from django.utils import timezone
 from django.utils.text import slugify
 
+from cms.page_schema import (
+    default_renderer_key_for_block_category,
+    normalize_block_template_builder_data,
+    normalize_page_content,
+)
+
 from .commerce_runtime import calculate_cart_pricing
 from .localization import localized_preview_url, sync_translation_paths
 from .models import (
@@ -267,6 +273,10 @@ def build_page_payload(page: Page, payload: dict) -> None:
         page.seo = payload["seo"] or {}
     if "page_settings" in payload:
         page.page_settings = payload["page_settings"] or {}
+    if "builder_schema_version" in payload:
+        page.builder_schema_version = payload["builder_schema_version"]
+    if "builder_data" in payload:
+        page.builder_data = payload["builder_data"] or {}
     if "project_data" in payload:
         page.builder_data = payload["project_data"] or {}
     if "html" in payload:
@@ -275,6 +285,33 @@ def build_page_payload(page: Page, payload: dict) -> None:
         page.css = payload["css"] or ""
     if "js" in payload:
         page.js = payload["js"] or ""
+
+    strict_schema_validation = any(
+        key in payload for key in ("builder_data", "project_data", "seo", "page_settings", "builder_schema_version")
+    )
+    normalized = normalize_page_content(
+        title=page.title,
+        slug=page.slug,
+        path=page.path,
+        is_homepage=page.is_homepage,
+        status=page.status,
+        locale_code="",
+        builder_data=page.builder_data,
+        seo=page.seo,
+        page_settings=page.page_settings,
+        html=page.html,
+        css=page.css,
+        js=page.js,
+        schema_version=page.builder_schema_version,
+        strict=strict_schema_validation,
+    )
+    page.builder_schema_version = normalized["schema_version"]
+    page.builder_data = normalized["builder_data"]
+    page.seo = normalized["seo"]
+    page.page_settings = normalized["page_settings"]
+    page.html = normalized["html"]
+    page.css = normalized["css"]
+    page.js = normalized["js"]
 
 
 def ensure_unique_page_path(page: Page) -> None:
@@ -307,6 +344,7 @@ def create_revision(page: Page, label: str) -> PageRevision:
     return PageRevision.objects.create(
         page=page,
         label=label,
+        builder_schema_version=page.builder_schema_version,
         snapshot=page.builder_data or {},
         html=page.html or "",
         css=page.css or "",
@@ -784,19 +822,39 @@ def create_site_starter_content(site: Site, starter_kit: str) -> None:
 
     for title, slug, is_homepage, factory in template:
         html, css = factory()
+        seo_payload = {
+            "meta_title": f"{site.name} | {title}",
+            "meta_description": site.tagline or site.description or f"{title} page for {site.name}",
+        }
+        normalized = normalize_page_content(
+            title=title,
+            slug=slug,
+            path=normalize_page_path(slug, is_homepage),
+            is_homepage=is_homepage,
+            status=Page.STATUS_DRAFT,
+            locale_code="",
+            builder_data={},
+            seo=seo_payload,
+            page_settings={},
+            html=html,
+            css=css,
+            js="",
+            strict=True,
+        )
         Page.objects.create(
             site=site,
             title=title,
             slug=slug,
-            path=normalize_page_path(slug, is_homepage),
+            path=normalized["path"],
             status=Page.STATUS_DRAFT,
             is_homepage=is_homepage,
-            seo={
-                "meta_title": f"{site.name} | {title}",
-                "meta_description": site.tagline or site.description or f"{title} page for {site.name}",
-            },
-            html=html,
-            css=css,
+            seo=normalized["seo"],
+            page_settings=normalized["page_settings"],
+            builder_schema_version=normalized["schema_version"],
+            builder_data=normalized["builder_data"],
+            html=normalized["html"],
+            css=normalized["css"],
+            js=normalized["js"],
         )
 
 
@@ -1455,12 +1513,36 @@ def ensure_global_block_templates() -> None:
     ]
 
     for template_data in templates:
+        renderer_key = default_renderer_key_for_block_category(template_data["category"])
+        compatibility_flags = {}
+        if renderer_key.startswith("forms."):
+            compatibility_flags["requires_forms"] = True
+        if renderer_key.startswith("blog."):
+            compatibility_flags["requires_blog"] = True
+        if renderer_key.startswith("commerce."):
+            compatibility_flags["requires_commerce"] = True
+
+        builder_payload = normalize_block_template_builder_data(
+            {
+                "metadata": {
+                    "template_name": template_data["name"],
+                    "description": template_data["description"],
+                }
+            },
+            renderer_key=renderer_key,
+            strict=False,
+        )
         BlockTemplate.objects.get_or_create(
             name=template_data["name"],
             is_global=True,
             defaults={
                 "category": template_data["category"],
+                "renderer_key": renderer_key,
+                "default_props_schema": {},
+                "version": 1,
+                "compatibility_flags": compatibility_flags,
                 "description": template_data["description"],
+                "builder_data": builder_payload,
                 "html": template_data["html"],
                 "is_premium": False,
                 "status": BlockTemplate.STATUS_PUBLISHED,

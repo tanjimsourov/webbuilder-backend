@@ -34,6 +34,7 @@ from cms.models import (  # noqa: F401
     RobotsTxt,
     URLRedirect,
 )
+from cms.page_schema import PAGE_SCHEMA_VERSION
 from domains.models import Domain, DomainAvailability, DomainContact  # noqa: F401
 from forms.models import Form, FormSubmission  # noqa: F401
 from jobs.models import Job  # noqa: F401
@@ -273,6 +274,7 @@ class PageReviewComment(TimeStampedModel):
 class PageRevision(models.Model):
     page = models.ForeignKey(Page, related_name="revisions", on_delete=models.CASCADE)
     label = models.CharField(max_length=180)
+    builder_schema_version = models.PositiveSmallIntegerField(default=PAGE_SCHEMA_VERSION)
     snapshot = models.JSONField(default=dict, blank=True)
     html = models.TextField(blank=True)
     css = models.TextField(blank=True)

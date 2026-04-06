@@ -3,21 +3,33 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path, re_path
 
-from builder.views import (
+from blog.views import (
     SiteBlogFeed,
     public_blog_index,
     public_blog_post,
+)
+from cms.views import (
     public_page,
     public_robots,
+    public_sitemap,
+)
+from commerce.views import (
     public_shop_cart,
     public_shop_index,
     public_shop_product,
-    public_sitemap,
 )
 
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/", include("core.urls")),
+    path("api/", include("cms.urls")),
+    path("api/", include("blog.urls")),
+    path("api/", include("forms.urls")),
+    path("api/", include("commerce.urls")),
+    path("api/", include("domains.urls")),
+    path("api/", include("analytics.urls")),
+    path("api/", include("notifications.urls")),
     path("api/payments/", include(("payments.urls", "payments"), namespace="payments")),
     path("api/email-hosting/", include(("email_hosting.urls", "email_hosting"), namespace="email_hosting")),
     path("api/", include("builder.urls")),

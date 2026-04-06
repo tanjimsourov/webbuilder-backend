@@ -46,6 +46,25 @@ class Site(TimeStampedModel):
     def __str__(self) -> str:
         return self.name
 
+    def default_locale_code(self) -> str:
+        """Return the default enabled locale code for public rendering."""
+        default_locale = self.locales.filter(is_enabled=True, is_default=True).first()
+        if default_locale:
+            return default_locale.code
+        first_enabled = self.locales.filter(is_enabled=True).order_by("code").first()
+        return first_enabled.code if first_enabled else "en"
+
+    def public_locales(self) -> list[dict[str, object]]:
+        """Return locale metadata safe for public runtime payloads."""
+        return [
+            {
+                "code": locale.code,
+                "direction": locale.direction,
+                "is_default": locale.is_default,
+            }
+            for locale in self.locales.filter(is_enabled=True).order_by("-is_default", "code")
+        ]
+
 
 class SiteLocale(TimeStampedModel):
     DIRECTION_LTR = "ltr"

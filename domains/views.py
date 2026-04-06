@@ -8,12 +8,8 @@ from builder.views import (
 )
 
 
-class DomainContactViewSet(BuilderDomainContactViewSet):
-    """Domain contact endpoints."""
-
-
-class DomainViewSet(BuilderDomainViewSet):
-    """Domain management endpoints."""
+DomainContactViewSet = BuilderDomainContactViewSet
+DomainViewSet = BuilderDomainViewSet
 
 
 __all__ = [

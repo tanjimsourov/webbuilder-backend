@@ -7,6 +7,8 @@ from django.conf import settings
 from django.utils import timezone
 from django.utils.text import slugify
 
+from cms.page_schema import extract_render_cache
+
 from .localization import select_best_locale
 from .models import ExperimentEvent, Page, PageExperiment, PageExperimentVariant, PageTranslation, Site, SiteLocale
 from .services import normalize_page_path
@@ -251,6 +253,17 @@ def apply_variant_to_page_payload(payload: dict[str, object], assignments: list[
             next_payload["css"] = variant.css
         if variant.js:
             next_payload["js"] = variant.js
+
+    cache = extract_render_cache(
+        next_payload.get("builder_data"),
+        html=next_payload.get("html", ""),
+        css=next_payload.get("css", ""),
+        js=next_payload.get("js", ""),
+        cache_first=False,
+    )
+    next_payload["html"] = cache["html"]
+    next_payload["css"] = cache["css"]
+    next_payload["js"] = cache["js"]
     return next_payload
 
 

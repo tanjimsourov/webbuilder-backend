@@ -1,9 +1,17 @@
 from decimal import Decimal
 
 from django.contrib.auth.hashers import make_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils.text import slugify
 from rest_framework import serializers
+
+from cms.page_schema import (
+    PAGE_SCHEMA_VERSION,
+    normalize_block_template_builder_data,
+    normalize_block_template_renderer_key,
+    normalize_page_content,
+)
 
 from .models import (
     BlockTemplate,
@@ -82,7 +90,7 @@ from .services import (
 class PageRevisionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PageRevision
-        fields = ["id", "label", "created_at"]
+        fields = ["id", "label", "builder_schema_version", "created_at"]
 
 
 class PageTranslationSerializer(serializers.ModelSerializer):
@@ -105,6 +113,7 @@ class PageTranslationSerializer(serializers.ModelSerializer):
             "status",
             "seo",
             "page_settings",
+            "builder_schema_version",
             "builder_data",
             "html",
             "css",
@@ -146,8 +155,40 @@ class PageTranslationSerializer(serializers.ModelSerializer):
         if query.exists():
             raise serializers.ValidationError({"slug": "Another translation already uses this path for the selected locale."})
 
+        strict_schema_validation = any(
+            field in attrs for field in ("builder_data", "seo", "page_settings", "builder_schema_version")
+        )
+        try:
+            normalized_payload = normalize_page_content(
+                title=attrs.get("title") or getattr(self.instance, "title", None) or page.title,
+                slug=slug,
+                path=path,
+                is_homepage=page.is_homepage,
+                status=attrs.get("status") or getattr(self.instance, "status", PageTranslation.STATUS_DRAFT),
+                locale_code=locale.code,
+                builder_data=attrs.get("builder_data", getattr(self.instance, "builder_data", {})),
+                seo=attrs.get("seo", getattr(self.instance, "seo", {})),
+                page_settings=attrs.get("page_settings", getattr(self.instance, "page_settings", {})),
+                html=attrs.get("html", getattr(self.instance, "html", "")),
+                css=attrs.get("css", getattr(self.instance, "css", "")),
+                js=attrs.get("js", getattr(self.instance, "js", "")),
+                schema_version=attrs.get(
+                    "builder_schema_version",
+                    getattr(self.instance, "builder_schema_version", PAGE_SCHEMA_VERSION),
+                ),
+                strict=strict_schema_validation,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
         attrs["slug"] = slug
         attrs["path"] = path
+        attrs["builder_schema_version"] = normalized_payload["schema_version"]
+        attrs["builder_data"] = normalized_payload["builder_data"]
+        attrs["seo"] = normalized_payload["seo"]
+        attrs["page_settings"] = normalized_payload["page_settings"]
+        attrs["html"] = normalized_payload["html"]
+        attrs["css"] = normalized_payload["css"]
+        attrs["js"] = normalized_payload["js"]
         return attrs
 
     @transaction.atomic
@@ -530,6 +571,7 @@ class PageSerializer(serializers.ModelSerializer):
             "is_homepage",
             "seo",
             "page_settings",
+            "builder_schema_version",
             "builder_data",
             "html",
             "css",
@@ -561,8 +603,41 @@ class PageSerializer(serializers.ModelSerializer):
         if query.exists():
             raise serializers.ValidationError({"slug": "Another page already uses this path."})
 
+        strict_schema_validation = any(
+            field in attrs for field in ("builder_data", "seo", "page_settings", "builder_schema_version")
+        )
+        try:
+            normalized_payload = normalize_page_content(
+                title=attrs.get("title") or getattr(self.instance, "title", None) or title,
+                slug=slug,
+                path=path,
+                is_homepage=is_homepage,
+                status=attrs.get("status") or getattr(self.instance, "status", Page.STATUS_DRAFT),
+                locale_code="",
+                builder_data=attrs.get("builder_data", getattr(self.instance, "builder_data", {})),
+                seo=attrs.get("seo", getattr(self.instance, "seo", {})),
+                page_settings=attrs.get("page_settings", getattr(self.instance, "page_settings", {})),
+                html=attrs.get("html", getattr(self.instance, "html", "")),
+                css=attrs.get("css", getattr(self.instance, "css", "")),
+                js=attrs.get("js", getattr(self.instance, "js", "")),
+                schema_version=attrs.get(
+                    "builder_schema_version",
+                    getattr(self.instance, "builder_schema_version", PAGE_SCHEMA_VERSION),
+                ),
+                strict=strict_schema_validation,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+
         attrs["slug"] = slug
         attrs["path"] = path
+        attrs["builder_schema_version"] = normalized_payload["schema_version"]
+        attrs["builder_data"] = normalized_payload["builder_data"]
+        attrs["seo"] = normalized_payload["seo"]
+        attrs["page_settings"] = normalized_payload["page_settings"]
+        attrs["html"] = normalized_payload["html"]
+        attrs["css"] = normalized_payload["css"]
+        attrs["js"] = normalized_payload["js"]
         return attrs
 
     @transaction.atomic
@@ -705,10 +780,67 @@ class BuilderSaveSerializer(serializers.Serializer):
     is_homepage = serializers.BooleanField(required=False)
     seo = serializers.JSONField(required=False)
     page_settings = serializers.JSONField(required=False)
+    builder_schema_version = serializers.IntegerField(required=False, min_value=1)
+    builder_data = serializers.JSONField(required=False)
     project_data = serializers.JSONField(required=False)
     html = serializers.CharField(required=False, allow_blank=True)
     css = serializers.CharField(required=False, allow_blank=True)
     js = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        has_builder_payload = "builder_data" in attrs or "project_data" in attrs
+        builder_data = attrs.get("builder_data")
+        project_data = attrs.get("project_data")
+        if builder_data is not None and project_data is not None and builder_data != project_data:
+            raise serializers.ValidationError(
+                {"builder_data": "Provide either builder_data or project_data; do not send conflicting values."}
+            )
+
+        canonical_builder_data = builder_data if builder_data is not None else project_data
+        if canonical_builder_data is None:
+            canonical_builder_data = {}
+
+        seo = attrs.get("seo", {})
+        page_settings = attrs.get("page_settings", {})
+        title = attrs.get("title") or "Page"
+        slug = slugify(attrs.get("slug") or title) or "page"
+        path = normalize_page_path(slug, attrs.get("is_homepage", False))
+
+        try:
+            normalized_payload = normalize_page_content(
+                title=title,
+                slug=slug,
+                path=path,
+                is_homepage=attrs.get("is_homepage", False),
+                status=Page.STATUS_DRAFT,
+                locale_code="",
+                builder_data=canonical_builder_data,
+                seo=seo,
+                page_settings=page_settings,
+                html=attrs.get("html", ""),
+                css=attrs.get("css", ""),
+                js=attrs.get("js", ""),
+                schema_version=attrs.get("builder_schema_version", PAGE_SCHEMA_VERSION),
+                strict=True,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+
+        attrs["builder_schema_version"] = normalized_payload["schema_version"]
+        if has_builder_payload:
+            attrs["builder_data"] = normalized_payload["builder_data"]
+            attrs["project_data"] = normalized_payload["builder_data"]
+        if "seo" in attrs:
+            attrs["seo"] = normalized_payload["seo"]
+        if "page_settings" in attrs:
+            attrs["page_settings"] = normalized_payload["page_settings"]
+        if "html" in attrs:
+            attrs["html"] = normalized_payload["html"]
+        if "css" in attrs:
+            attrs["css"] = normalized_payload["css"]
+        if "js" in attrs:
+            attrs["js"] = normalized_payload["js"]
+        return attrs
 
 
 class SiteMirrorImportSerializer(serializers.Serializer):
@@ -1550,6 +1682,10 @@ class BlockTemplateSerializer(serializers.ModelSerializer):
             "site",
             "name",
             "category",
+            "renderer_key",
+            "default_props_schema",
+            "version",
+            "compatibility_flags",
             "description",
             "thumbnail_url",
             "builder_data",
@@ -1567,6 +1703,56 @@ class BlockTemplateSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["usage_count"]
+
+    def validate(self, attrs):
+        category = attrs.get("category", getattr(self.instance, "category", BlockTemplate.CATEGORY_OTHER))
+        strict_renderer = "renderer_key" in attrs or self.instance is None
+        renderer_key = normalize_block_template_renderer_key(
+            attrs.get("renderer_key", getattr(self.instance, "renderer_key", "")),
+            category=category,
+            strict=strict_renderer,
+        )
+        attrs["renderer_key"] = renderer_key
+
+        default_props_schema = attrs.get(
+            "default_props_schema",
+            getattr(self.instance, "default_props_schema", {}),
+        )
+        if default_props_schema is None:
+            default_props_schema = {}
+        if not isinstance(default_props_schema, dict):
+            raise serializers.ValidationError({"default_props_schema": "Must be a JSON object."})
+        attrs["default_props_schema"] = default_props_schema
+
+        compatibility_flags = attrs.get(
+            "compatibility_flags",
+            getattr(self.instance, "compatibility_flags", {}),
+        )
+        if compatibility_flags is None:
+            compatibility_flags = {}
+        if not isinstance(compatibility_flags, dict):
+            raise serializers.ValidationError({"compatibility_flags": "Must be a JSON object."})
+        attrs["compatibility_flags"] = compatibility_flags
+
+        version_raw = attrs.get("version", getattr(self.instance, "version", 1))
+        try:
+            version_value = int(version_raw)
+        except (TypeError, ValueError) as exc:
+            raise serializers.ValidationError({"version": "Must be an integer greater than or equal to 1."}) from exc
+        if version_value < 1:
+            raise serializers.ValidationError({"version": "Must be greater than or equal to 1."})
+        attrs["version"] = version_value
+
+        normalize_strict = "builder_data" in attrs
+        source_builder_data = attrs.get("builder_data", getattr(self.instance, "builder_data", {}))
+        normalized_builder_data = normalize_block_template_builder_data(
+            source_builder_data,
+            renderer_key=renderer_key,
+            strict=normalize_strict,
+        )
+        if self.instance is None or "builder_data" in attrs:
+            attrs["builder_data"] = normalized_builder_data
+        return attrs
 
 
 class URLRedirectSerializer(serializers.ModelSerializer):

@@ -2,6 +2,7 @@ import secrets
 
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core import signing
 from django.db import models
 from django.http import Http404, HttpResponse, HttpResponseRedirect
@@ -18,6 +19,8 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from cms.page_schema import extract_page_summary, extract_render_cache, normalize_page_content
 
 # TODO: In Phase 5, move all view logic into domain-specific apps. Temporarily
 # keep these runtime helpers imported from the monolith module.
@@ -484,11 +487,12 @@ class WorkspaceSearchView(APIView):
         return [self._serialize_media(assets[media_id], request) for media_id in media_ids if media_id in assets]
 
     def _serialize_page(self, page: Page) -> dict[str, object]:
+        summary = extract_page_summary(page.builder_data) or page.seo.get("meta_description", "") or page.path
         return {
             "id": f"page_{page.id}",
             "type": "page",
             "title": page.title,
-            "excerpt": _truncate_text(page.html or page.seo.get("meta_description", "") or page.path),
+            "excerpt": _truncate_text(summary),
             "url": _editor_page_url(page),
             "preview_url": preview_url_for_page(page),
             "site_id": page.site_id,
@@ -891,7 +895,10 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         page = self.get_object()
         serializer = BuilderSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        build_page_payload(page, serializer.validated_data)
+        try:
+            build_page_payload(page, serializer.validated_data)
+        except DjangoValidationError as exc:
+            return Response(exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         sync_homepage_state(page)
         try:
             ensure_unique_page_path(page)
@@ -909,7 +916,10 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         page = self.get_object()
         serializer = BuilderSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        build_page_payload(page, serializer.validated_data)
+        try:
+            build_page_payload(page, serializer.validated_data)
+        except DjangoValidationError as exc:
+            return Response(exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         sync_homepage_state(page)
         try:
             ensure_unique_page_path(page)
@@ -983,7 +993,10 @@ class PageTranslationViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         translation = self.get_object()
         serializer = BuilderSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        build_translation_payload(translation, serializer.validated_data)
+        try:
+            build_translation_payload(translation, serializer.validated_data)
+        except DjangoValidationError as exc:
+            return Response(exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         try:
             PageTranslationSerializer(instance=translation, data={"page": translation.page_id, "locale": translation.locale_id, "slug": translation.slug, "title": translation.title}, partial=True).is_valid(raise_exception=True)
         except serializers.ValidationError as exc:
@@ -999,7 +1012,10 @@ class PageTranslationViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         translation = self.get_object()
         serializer = BuilderSaveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        build_translation_payload(translation, serializer.validated_data)
+        try:
+            build_translation_payload(translation, serializer.validated_data)
+        except DjangoValidationError as exc:
+            return Response(exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         try:
             PageTranslationSerializer(instance=translation, data={"page": translation.page_id, "locale": translation.locale_id, "slug": translation.slug, "title": translation.title}, partial=True).is_valid(raise_exception=True)
         except serializers.ValidationError as exc:
@@ -1300,12 +1316,46 @@ class PageRevisionViewSet(SitePermissionMixin, viewsets.ReadOnlyModelViewSet):
     def restore(self, request, pk=None):
         revision = self.get_object()
         page = revision.page
-        page.builder_data = revision.snapshot or {}
-        page.html = revision.html or ""
-        page.css = revision.css or ""
-        page.js = revision.js or ""
+        try:
+            normalized = normalize_page_content(
+                title=page.title,
+                slug=page.slug,
+                path=page.path,
+                is_homepage=page.is_homepage,
+                status=Page.STATUS_DRAFT,
+                locale_code="",
+                builder_data=revision.snapshot or {},
+                seo=page.seo,
+                page_settings=page.page_settings,
+                html=revision.html or "",
+                css=revision.css or "",
+                js=revision.js or "",
+                schema_version=revision.builder_schema_version,
+                strict=True,
+            )
+        except DjangoValidationError as exc:
+            return Response(exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        page.builder_schema_version = normalized["schema_version"]
+        page.builder_data = normalized["builder_data"]
+        page.seo = normalized["seo"]
+        page.page_settings = normalized["page_settings"]
+        page.html = normalized["html"]
+        page.css = normalized["css"]
+        page.js = normalized["js"]
         page.status = Page.STATUS_DRAFT
-        page.save(update_fields=["builder_data", "html", "css", "js", "status", "updated_at"])
+        page.save(
+            update_fields=[
+                "builder_schema_version",
+                "builder_data",
+                "seo",
+                "page_settings",
+                "html",
+                "css",
+                "js",
+                "status",
+                "updated_at",
+            ]
+        )
         create_revision(page, f"Restored from {revision.label}")
         return Response(PageSerializer(page, context={"request": request}).data)
 
@@ -2234,19 +2284,34 @@ def public_page(request, site_slug: str, page_path: str = "", locale_code: str |
     normalized_path = "/" if not page_path else f'/{page_path.strip("/")}/'
     locale = _resolve_site_locale(site, locale_code)
     page, translation = _resolve_localized_page(site, locale, normalized_path)
+    source_builder_data = translation.builder_data if translation else page.builder_data
+    builder_meta = source_builder_data.get("metadata") if isinstance(source_builder_data, dict) else {}
+    builder_seo = source_builder_data.get("seo") if isinstance(source_builder_data, dict) else {}
+    render_cache = extract_render_cache(
+        source_builder_data,
+        html=translation.html if translation else page.html,
+        css=translation.css if translation else page.css,
+        js=translation.js if translation else page.js,
+    )
     payload = {
-        "title": translation.title if translation else page.title,
-        "seo": translation.seo if translation else page.seo,
+        "title": (
+            str(builder_meta.get("title") or "").strip()
+            if isinstance(builder_meta, dict) and str(builder_meta.get("title") or "").strip()
+            else (translation.title if translation else page.title)
+        ),
+        "seo": builder_seo if isinstance(builder_seo, dict) and builder_seo else (translation.seo if translation else page.seo),
         "page_settings": translation.page_settings if translation else page.page_settings,
-        "builder_data": translation.builder_data if translation else page.builder_data,
-        "html": translation.html if translation else page.html,
-        "css": translation.css if translation else page.css,
-        "js": translation.js if translation else page.js,
+        "builder_data": source_builder_data,
+        "html": render_cache["html"],
+        "css": render_cache["css"],
+        "js": render_cache["js"],
     }
     experiment_context = evaluate_page_experiments(request, page, translation.locale if translation else locale)
     payload = apply_variant_to_page_payload(payload, experiment_context["assignments"])
+    page_settings = payload["page_settings"] if isinstance(payload.get("page_settings"), dict) else {}
+    seo_payload = payload["seo"] if isinstance(payload.get("seo"), dict) else {}
 
-    if payload["page_settings"].get("document_mode") == "full_html" and str(payload["html"]).lstrip().lower().startswith("<!doctype html"):
+    if page_settings.get("document_mode") == "full_html" and str(payload["html"]).lstrip().lower().startswith("<!doctype html"):
         response = HttpResponse(payload["html"], content_type="text/html; charset=utf-8")
         return persist_experiment_cookies(
             response,
@@ -2256,8 +2321,8 @@ def public_page(request, site_slug: str, page_path: str = "", locale_code: str |
             assignment_cookie_changed=experiment_context["assignment_cookie_changed"],
         )
 
-    meta_title = payload["seo"].get("meta_title") or f"{site.name} | {payload['title']}"
-    meta_description = payload["seo"].get("meta_description") or site.tagline or site.description or payload["title"]
+    meta_title = seo_payload.get("meta_title") or f"{site.name} | {payload['title']}"
+    meta_description = seo_payload.get("meta_description") or site.tagline or site.description or payload["title"]
     response = render(
         request,
         "builder/published_page.html",
