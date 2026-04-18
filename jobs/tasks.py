@@ -1,10 +1,39 @@
 """Celery tasks for background processing."""
 
-from celery import shared_task
+import logging
 
+from django.utils import timezone
+
+from builder.models import PlatformEmailCampaign, WebhookDelivery
+from builder.platform_admin_services import send_platform_campaign
 from cms import services as cms_services
 from email_hosting import services as email_services
 from email_hosting.models import EmailDomain
+from jobs.services import create_job_with_retry
+
+logger = logging.getLogger(__name__)
+
+try:
+    from celery import shared_task
+except ImportError:  # pragma: no cover
+    def shared_task(*task_args, **task_kwargs):
+        if task_args and callable(task_args[0]) and len(task_args) == 1 and not task_kwargs:
+            return task_args[0]
+
+        def decorator(func):
+            if task_kwargs.get("bind"):
+                class _FallbackTask:
+                    @staticmethod
+                    def retry(exc):
+                        raise exc
+
+                def wrapped(*args, **kwargs):
+                    return func(_FallbackTask(), *args, **kwargs)
+
+                return wrapped
+            return func
+
+        return decorator
 
 
 @shared_task
@@ -28,23 +57,56 @@ def runtime_revalidate(self, payload: dict | None = None) -> dict:
 
 
 @shared_task
-def send_notification_email(notification_id: int | None = None) -> None:
-    """Send queued notification emails.
+def send_notification_email(notification_id: int | None = None) -> dict:
+    """Send platform email campaigns by id or queue-ready state.
 
-    ``notification_id`` is optional to support batch-mode runs later.
+    ``notification_id`` maps to ``PlatformEmailCampaign.id``.
     """
-    # TODO: implement email dispatch via notifications service layer.
-    _ = notification_id
+    campaigns = PlatformEmailCampaign.objects.filter(status=PlatformEmailCampaign.STATUS_DRAFT)
+    if notification_id is not None:
+        campaigns = campaigns.filter(pk=notification_id)
+    campaigns = campaigns.order_by("created_at")[:10]
+
+    sent = 0
+    failed = 0
+    for campaign in campaigns:
+        updated = send_platform_campaign(campaign)
+        if updated.status == PlatformEmailCampaign.STATUS_SENT:
+            sent += 1
+        else:
+            failed += 1
+            logger.warning("Platform campaign %s failed to send: %s", updated.id, updated.last_error)
+    return {"processed": len(campaigns), "sent": sent, "failed": failed}
 
 
 @shared_task
-def retry_webhook_delivery(delivery_id: int | None = None) -> None:
-    """Retry failed webhook deliveries.
+def retry_webhook_delivery(delivery_id: int | None = None) -> dict:
+    """Queue webhook retries for one or many pending/failed deliveries.
 
-    ``delivery_id`` is optional to support bulk retries by schedule.
+    ``delivery_id`` is optional; when omitted, due deliveries are retried in bulk.
     """
-    # TODO: implement webhook retry logic via notifications domain services.
-    _ = delivery_id
+    deliveries = WebhookDelivery.objects.select_related("webhook")
+    if delivery_id is not None:
+        deliveries = deliveries.filter(pk=delivery_id)
+    else:
+        now = timezone.now()
+        deliveries = deliveries.filter(
+            status__in=[WebhookDelivery.STATUS_PENDING, WebhookDelivery.STATUS_FAILED],
+            next_attempt_at__isnull=False,
+            next_attempt_at__lte=now,
+        )
+
+    queued = 0
+    for delivery in deliveries[:200]:
+        create_job_with_retry(
+            "deliver_webhook",
+            {"delivery_id": delivery.id},
+            priority=10,
+            max_retries=max(1, delivery.max_attempts - delivery.attempt_count),
+            idempotency_key=f"retry_delivery:{delivery.id}:{delivery.attempt_count}",
+        )
+        queued += 1
+    return {"queued": queued}
 
 
 @shared_task

@@ -7,6 +7,10 @@ on:
 jobs:
   test-and-security:
     runs-on: ubuntu-latest
+    env:
+      DJANGO_DEBUG: "true"
+      DJANGO_SECRET_KEY: "ci-dev-secret-key-1234567890abcdefghijklmnopqrstuvwxyz"
+      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1"
 
     steps:
       - name: Checkout
@@ -22,7 +26,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -r requirements-dev.txt
           pip install pip-audit
+
+      - name: Dependency Integrity Check
+        run: python -m pip check
+
+      - name: Ruff Lint (syntax + undefined names)
+        run: python -m ruff check .
 
       - name: Django System Check
         run: python manage.py check
@@ -37,17 +48,30 @@ jobs:
           DJANGO_PLATFORM_FRONTEND_ORIGINS: "https://localhost"
           DJANGO_AUTH_BOOTSTRAP_ENABLED: "false"
           DJANGO_AUTH_MAGIC_LOGIN_ENABLED: "false"
+          DJANGO_ENABLE_ADMIN: "false"
           DJANGO_METRICS_AUTH_TOKEN: "ci-metrics-token-1234567890"
           DJANGO_CACHE_URL: "redis://127.0.0.1:6379/1"
+          DJANGO_DB_ENGINE: "django.db.backends.postgresql"
+          DJANGO_DB_NAME: "webbuilder"
+          DJANGO_DB_USER: "webbuilder"
+          DJANGO_DB_PASSWORD: "ci-db-password-1234567890"
+          DJANGO_DB_HOST: "127.0.0.1"
+          DJANGO_DB_PORT: "5432"
           LIBRECRAWL_ENABLED: "false"
           SERPBEAR_ENABLED: "false"
           UMAMI_ENABLED: "false"
           PAYLOAD_CMS_ENABLED: "false"
           PAYLOAD_ECOMMERCE_ENABLED: "false"
+          DJANGO_METRICS_ALLOW_QUERY_TOKEN: "false"
+          DJANGO_REDIRECT_ALLOWED_EXTERNAL_HOSTS: ""
+          DJANGO_ALLOW_PRIVATE_WEBHOOK_TARGETS: "false"
         run: python manage.py check --deploy --fail-level WARNING
 
-      - name: Run Tests
-        run: python manage.py test builder
+      - name: Migration Drift Check
+        run: python scripts/check_migration_drift.py
+
+      - name: Run Full Test Suite
+        run: python manage.py test --verbosity 2
 
       - name: Dependency Audit
         run: python -m pip_audit -r requirements.txt

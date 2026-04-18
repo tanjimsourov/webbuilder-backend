@@ -34,6 +34,8 @@ When `DJANGO_DEBUG=false`, startup now fails immediately unless all critical con
 - `DJANGO_SECURE_HSTS_PRELOAD=true`
 - `DJANGO_USE_X_FORWARDED_HOST=true`
 - `DJANGO_X_FRAME_OPTIONS=DENY`
+- `DJANGO_METRICS_ALLOW_QUERY_TOKEN=false`
+- `DJANGO_AUTH_MAGIC_LOGIN_ENABLED=false`
 
 ### Additional validation behavior
 
@@ -45,6 +47,11 @@ When `DJANGO_DEBUG=false`, startup now fails immediately unless all critical con
 - If `PAYLOAD_ECOMMERCE_ENABLED=true`, database, secret, and Stripe companion secrets are required.
 - If `LIBRECRAWL_ENABLED=true` and `LIBRECRAWL_LOCAL_MODE=false`, `LIBRECRAWL_SECRET_KEY` is required.
 - Placeholder-like secrets are rejected in production across validated integration keys.
+- `DJANGO_REDIRECT_ALLOWED_EXTERNAL_HOSTS` defines the only external hosts allowed for managed URL redirects.
+- `DJANGO_ALLOW_PRIVATE_WEBHOOK_TARGETS` controls whether webhook URLs may target private/loopback hosts (disabled by default in production).
+- `DJANGO_PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS` controls webhook replay protection cache lifetime.
+- `MEILISEARCH_SETTINGS_SYNC_INTERVAL_SECONDS` controls how often index settings are re-synced per API process (default: `300` seconds).
+- `/admin/` is blocked with a 404 response when `DJANGO_ENABLE_ADMIN=false` (default in production).
 
 ## Secrets Policy
 

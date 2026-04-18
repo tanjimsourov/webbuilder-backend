@@ -7,6 +7,29 @@ import logging
 import traceback
 from datetime import datetime
 
+SENSITIVE_FIELD_MARKERS = {
+    "password",
+    "secret",
+    "token",
+    "authorization",
+    "api_key",
+    "private_key",
+    "session",
+    "cookie",
+    "signature",
+}
+
+
+def _redact_sensitive(value, key: str | None = None):
+    key_lower = (key or "").lower()
+    if key_lower and any(marker in key_lower for marker in SENSITIVE_FIELD_MARKERS):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {k: _redact_sensitive(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_sensitive(item, key) for item in value]
+    return value
+
 
 class JsonFormatter(logging.Formatter):
     """
@@ -51,7 +74,7 @@ class JsonFormatter(logging.Formatter):
                     extra_fields[key] = str(value)
 
         if extra_fields:
-            log_data["extra"] = extra_fields
+            log_data["extra"] = _redact_sensitive(extra_fields)
 
         return json.dumps(log_data, default=str)
 

@@ -44,6 +44,7 @@ class Job(TimeStampedModel):
         indexes = [
             models.Index(fields=["status", "scheduled_at"]),
             models.Index(fields=["job_type", "status"]),
+            models.Index(fields=["status", "-priority", "scheduled_at"]),
         ]
 
     def __str__(self) -> str:

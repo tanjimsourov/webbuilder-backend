@@ -26,6 +26,9 @@ class FormSubmission(TimeStampedModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["site", "form_name", "-created_at"]),
+        ]
 
     def __str__(self) -> str:
         return f"{self.site.name}: {self.form_name}"

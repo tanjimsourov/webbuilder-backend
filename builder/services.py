@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal, ROUND_HALF_UP
+from functools import lru_cache
 from typing import Iterable
 from uuid import uuid4
 
 from django.conf import settings
+from django.db import connection
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -202,6 +205,9 @@ img { max-width: 100%; display: block; }
 """.strip()
 
 
+logger = logging.getLogger(__name__)
+
+
 def default_theme() -> dict:
     return {
         "brandColor": "#2463eb",
@@ -340,7 +346,35 @@ def sync_homepage_state(page: Page) -> None:
     sync_translation_paths(page)
 
 
-def create_revision(page: Page, label: str) -> PageRevision:
+@lru_cache(maxsize=1)
+def _page_revision_fk_target_table() -> str:
+    """Return the physical table targeted by `builder_pagerevision.page_id` FK."""
+    with connection.cursor() as cursor:
+        constraints = connection.introspection.get_constraints(cursor, PageRevision._meta.db_table)
+    for constraint in constraints.values():
+        columns = constraint.get("columns") or []
+        foreign_key = constraint.get("foreign_key")
+        if "page_id" in columns and foreign_key:
+            return foreign_key[0]
+    return PageRevision._meta.get_field("page").remote_field.model._meta.db_table
+
+
+def _row_exists(table_name: str, row_id: int) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT 1 FROM {connection.ops.quote_name(table_name)} WHERE id = %s LIMIT 1", [row_id])
+        return cursor.fetchone() is not None
+
+
+def create_revision(page: Page, label: str) -> PageRevision | None:
+    target_table = _page_revision_fk_target_table()
+    if not _row_exists(target_table, page.pk):
+        logger.warning(
+            "Skipping revision creation for page %s: FK table '%s' has no matching row.",
+            page.pk,
+            target_table,
+        )
+        return None
+
     return PageRevision.objects.create(
         page=page,
         label=label,
@@ -1602,9 +1636,13 @@ def _dispatch_webhook(webhook_id: int, payload: dict) -> None:
 
 
 def trigger_webhooks(site, event: str, payload: dict) -> None:
-    """Enqueue active webhooks for *event* on *site*. Each fires in a daemon thread."""
-    import threading
+    """Queue active webhook deliveries for *event* on *site*."""
+    import logging
+    from django.db import transaction
+    from .jobs import queue_webhook_delivery
     from .models import Webhook
+
+    logger = logging.getLogger(__name__)
 
     compatible_events = {event}
     legacy_alias = {
@@ -1618,6 +1656,16 @@ def trigger_webhooks(site, event: str, payload: dict) -> None:
         Webhook.objects.filter(site=site, event__in=compatible_events, status=Webhook.STATUS_ACTIVE)
         .values_list("pk", flat=True)
     )
-    for wid in webhook_ids:
-        t = threading.Thread(target=_dispatch_webhook, args=(wid, payload), daemon=True)
-        t.start()
+
+    def _enqueue_deliveries():
+        for wid in webhook_ids:
+            try:
+                queue_webhook_delivery(wid, event, payload)
+            except Exception:
+                logger.exception("Failed to queue webhook delivery %s; falling back to inline dispatch.", wid)
+                _dispatch_webhook(wid, payload)
+
+    if transaction.get_connection().in_atomic_block:
+        transaction.on_commit(_enqueue_deliveries)
+    else:
+        _enqueue_deliveries()

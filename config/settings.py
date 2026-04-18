@@ -169,6 +169,8 @@ ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", ["127.0.0.1", "localhost"] if D
 if IS_PRODUCTION and not ALLOWED_HOSTS:
     raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS must be configured when DJANGO_DEBUG is false.")
 _validate_allowed_hosts(ALLOWED_HOSTS)
+REDIRECT_ALLOWED_EXTERNAL_HOSTS = env_list("DJANGO_REDIRECT_ALLOWED_EXTERNAL_HOSTS", [])
+_validate_allowed_hosts(REDIRECT_ALLOWED_EXTERNAL_HOSTS)
 
 LIBRECRAWL_ENABLED = env_bool("LIBRECRAWL_ENABLED", False)
 LIBRECRAWL_HOST = env_str("LIBRECRAWL_HOST", "127.0.0.1")
@@ -317,7 +319,13 @@ ENABLE_REQUEST_SEED_DATA = env_bool("DJANGO_ENABLE_REQUEST_SEED_DATA", DEBUG)
 AUTH_BOOTSTRAP_ENABLED = env_bool("DJANGO_AUTH_BOOTSTRAP_ENABLED", DEBUG)
 AUTH_BOOTSTRAP_TOKEN = env_str("DJANGO_AUTH_BOOTSTRAP_TOKEN")
 AUTH_MAGIC_LOGIN_ENABLED = env_bool("DJANGO_AUTH_MAGIC_LOGIN_ENABLED", DEBUG)
+ENABLE_ADMIN = env_bool("DJANGO_ENABLE_ADMIN", DEBUG)
 METRICS_AUTH_TOKEN = env_str("DJANGO_METRICS_AUTH_TOKEN")
+METRICS_ALLOW_QUERY_TOKEN = env_bool("DJANGO_METRICS_ALLOW_QUERY_TOKEN", DEBUG)
+ALLOW_PRIVATE_WEBHOOK_TARGETS = env_bool("DJANGO_ALLOW_PRIVATE_WEBHOOK_TARGETS", DEBUG)
+PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS = int(
+    env_str("DJANGO_PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS", str(7 * 24 * 60 * 60))
+)
 _ensure_not_placeholder("DJANGO_AUTH_BOOTSTRAP_TOKEN", AUTH_BOOTSTRAP_TOKEN)
 _ensure_not_placeholder("DJANGO_METRICS_AUTH_TOKEN", METRICS_AUTH_TOKEN)
 
@@ -352,6 +360,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "builder.middleware.AdminAccessMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "builder.middleware.RedirectMiddleware",
@@ -800,11 +809,18 @@ def _validate_production_settings() -> None:
             )
         if len(AUTH_BOOTSTRAP_TOKEN) < 24:
             raise ImproperlyConfigured("DJANGO_AUTH_BOOTSTRAP_TOKEN must be at least 24 characters.")
+    if AUTH_MAGIC_LOGIN_ENABLED:
+        raise ImproperlyConfigured("DJANGO_AUTH_MAGIC_LOGIN_ENABLED must be false in production.")
 
     if not METRICS_AUTH_TOKEN:
         raise ImproperlyConfigured("DJANGO_METRICS_AUTH_TOKEN must be set in production.")
     if len(METRICS_AUTH_TOKEN) < 24:
         raise ImproperlyConfigured("DJANGO_METRICS_AUTH_TOKEN must be at least 24 characters in production.")
+    if METRICS_ALLOW_QUERY_TOKEN:
+        raise ImproperlyConfigured("DJANGO_METRICS_ALLOW_QUERY_TOKEN must be false in production.")
+
+    if PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS <= 0:
+        raise ImproperlyConfigured("DJANGO_PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS must be a positive integer.")
 
 
 _validate_production_settings()

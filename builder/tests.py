@@ -1,25 +1,31 @@
 import shutil
 from unittest import mock
 from pathlib import Path
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection, transaction
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from django.test import Client, TestCase, override_settings
 
 from .experiments import ASSIGNMENTS_COOKIE_NAME, VISITOR_COOKIE_NAME
 from .models import (
+    BlockTemplate,
     Cart,
     Comment,
     DiscountCode,
     ExperimentEvent,
+    Form,
     FormSubmission,
     MediaAsset,
     Order,
     Page,
     PageExperiment,
     PageExperimentVariant,
+    PageRevision,
     PlatformEmailCampaign,
     PlatformOffer,
     PlatformSubscription,
@@ -32,6 +38,7 @@ from .models import (
     SiteLocale,
     ShippingZone,
     TaxRate,
+    Webhook,
     Workspace,
     WorkspaceMembership,
     WorkspaceInvitation,
@@ -50,6 +57,18 @@ class BuilderPlatformTests(TestCase):
 
     def setUp(self):
         self.client = Client(enforce_csrf_checks=True)
+
+    def tearDown(self):
+        # Transitional cleanup: builder legacy tables still reference historical
+        # builder_* parents while runtime objects now come from modular apps.
+        ExperimentEvent.objects.all().delete()
+        PageExperimentVariant.objects.all().delete()
+        PageExperiment.objects.all().delete()
+        PageReviewComment.objects.all().delete()
+        PageReview.objects.all().delete()
+        PageRevision.objects.all().delete()
+        PlatformSubscription.objects.all().delete()
+        super().tearDown()
 
     def _csrf_token_for(self, client: Client) -> str:
         response = client.get("/api/auth/status/")
@@ -1579,6 +1598,11 @@ class ProductionHardeningTests(TestCase):
         allowed = self.client.get("/api/metrics/", HTTP_X_METRICS_TOKEN="metrics-token")
         self.assertEqual(allowed.status_code, 200)
 
+    @override_settings(DEBUG=False, METRICS_AUTH_TOKEN="metrics-token", METRICS_ALLOW_QUERY_TOKEN=False)
+    def test_metrics_endpoint_rejects_query_token_when_disabled(self):
+        blocked = self.client.get("/api/metrics/?token=metrics-token")
+        self.assertEqual(blocked.status_code, 404)
+
     @override_settings(DEBUG=False, AUTH_BOOTSTRAP_ENABLED=False)
     def test_bootstrap_can_be_disabled_for_production(self):
         """Bootstrap endpoint is disabled when explicit production gate is off."""
@@ -1592,6 +1616,51 @@ class ProductionHardeningTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 403)
+
+    @override_settings(ENABLE_ADMIN=False)
+    def test_admin_endpoint_is_hidden_when_disabled(self):
+        response = self.client.get("/admin/")
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(AUTH_MAGIC_LOGIN_ENABLED=True)
+    def test_magic_login_blocks_scheme_relative_redirect(self):
+        user = User.objects.create_user(
+            username="magic-user",
+            email="magic@example.com",
+            password="VerySecurePass123",
+        )
+        response = self.client.get(f"/api/auth/magic-login/?username={user.username}&next=//evil.example/path")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsafe", response.json()["detail"].lower())
+
+    @override_settings(RUNNING_TESTS=False)
+    def test_login_endpoint_enforces_throttle_limit(self):
+        from django.conf import settings
+        from django.core.cache import cache
+
+        User.objects.create_user("throttle-user", "throttle@example.com", "VerySecurePass123")
+        throttle_rates = dict(settings.REST_FRAMEWORK.get("DEFAULT_THROTTLE_RATES", {}))
+        throttle_rates["auth_login"] = "2/minute"
+        hardened_rest_framework = dict(settings.REST_FRAMEWORK)
+        hardened_rest_framework["DEFAULT_THROTTLE_RATES"] = throttle_rates
+
+        with override_settings(REST_FRAMEWORK=hardened_rest_framework):
+            cache.clear()
+            throttle_client = Client(enforce_csrf_checks=True)
+            csrf_token = throttle_client.get("/api/auth/status/").cookies["csrftoken"].value
+            observed_statuses = []
+            for _ in range(30):
+                response = throttle_client.post(
+                    "/api/auth/login/",
+                    {"username": "throttle-user", "password": "wrong-password"},
+                    content_type="application/json",
+                    HTTP_X_CSRFTOKEN=csrf_token,
+                )
+                observed_statuses.append(response.status_code)
+                if response.status_code == 429:
+                    break
+
+            self.assertIn(429, observed_statuses)
 
     def test_svg_validation_rejects_script_tags(self):
         """SVG validation rejects files containing script tags."""
@@ -1789,3 +1858,427 @@ class ProductionHardeningTests(TestCase):
         attempt_count = 2
         expected_key = f"webhook_retry:{delivery_id}:{attempt_count}"
         self.assertEqual(expected_key, "webhook_retry:123:2")
+
+
+class WorkspaceAndSecurityRegressionTests(TestCase):
+    def setUp(self):
+        self.client = Client(enforce_csrf_checks=True)
+        self.owner = User.objects.create_user(
+            username="workspace-owner",
+            email="workspace-owner@example.com",
+            password="VerySecurePass123",
+        )
+        self.workspace = Workspace.objects.create(name="Secure Ops", slug="secure-ops", owner=self.owner)
+        WorkspaceMembership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=WorkspaceMembership.ROLE_OWNER,
+            invited_by=self.owner,
+        )
+        self.site = Site.objects.create(name="Secure Site", slug="secure-site", workspace=self.workspace)
+        self._login(self.owner.username, "VerySecurePass123")
+
+    def _csrf_token(self) -> str:
+        response = self.client.get("/api/auth/status/")
+        self.assertEqual(response.status_code, 200)
+        return response.cookies["csrftoken"].value
+
+    def _login(self, username: str, password: str) -> None:
+        response = self.client.post(
+            "/api/auth/login/",
+            {"username": username, "password": password},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def _login_client(self, client: Client, username: str, password: str) -> None:
+        csrf = client.get("/api/auth/status/").cookies["csrftoken"].value
+        response = client.post(
+            "/api/auth/login/",
+            {"username": username, "password": password},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=csrf,
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_workspace_invite_rejects_owner_role(self):
+        response = self.client.post(
+            f"/api/workspaces/{self.workspace.id}/invite/",
+            {"email": "new-owner@example.com", "role": WorkspaceMembership.ROLE_OWNER},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(
+            WorkspaceInvitation.objects.filter(workspace=self.workspace, email="new-owner@example.com").exists()
+        )
+
+    def test_workspace_invite_reuses_pending_invitation(self):
+        first_response = self.client.post(
+            f"/api/workspaces/{self.workspace.id}/invite/",
+            {"email": "repeat@example.com", "role": WorkspaceMembership.ROLE_EDITOR},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(first_response.status_code, 201)
+        invitation_id = first_response.json()["id"]
+
+        second_response = self.client.post(
+            f"/api/workspaces/{self.workspace.id}/invite/",
+            {"email": "repeat@example.com", "role": WorkspaceMembership.ROLE_ADMIN},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()["id"], invitation_id)
+        invitation = WorkspaceInvitation.objects.get(pk=invitation_id)
+        self.assertEqual(invitation.role, WorkspaceMembership.ROLE_ADMIN)
+
+    def test_workspace_viewer_cannot_update_workspace(self):
+        viewer = User.objects.create_user("workspace-viewer", "viewer@example.com", "VerySecurePass123")
+        WorkspaceMembership.objects.create(
+            workspace=self.workspace,
+            user=viewer,
+            role=WorkspaceMembership.ROLE_VIEWER,
+            invited_by=self.owner,
+            accepted_at=timezone.now(),
+        )
+
+        viewer_client = Client(enforce_csrf_checks=True)
+        self._login_client(viewer_client, viewer.username, "VerySecurePass123")
+
+        response = viewer_client.patch(
+            f"/api/workspaces/{self.workspace.id}/",
+            {"name": "Viewer Rename Attempt"},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=viewer_client.get("/api/auth/status/").cookies["csrftoken"].value,
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_workspace_owner_can_update_when_membership_row_missing(self):
+        WorkspaceMembership.objects.filter(workspace=self.workspace, user=self.owner).delete()
+
+        response = self.client.patch(
+            f"/api/workspaces/{self.workspace.id}/",
+            {"name": "Owner Updated Name"},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.workspace.refresh_from_db()
+        self.assertEqual(self.workspace.name, "Owner Updated Name")
+
+    def test_workspace_invitations_requires_manage_members_permission(self):
+        viewer = User.objects.create_user("invite-viewer", "invite-viewer@example.com", "VerySecurePass123")
+        WorkspaceMembership.objects.create(
+            workspace=self.workspace,
+            user=viewer,
+            role=WorkspaceMembership.ROLE_VIEWER,
+            invited_by=self.owner,
+            accepted_at=timezone.now(),
+        )
+        WorkspaceInvitation.objects.create(
+            workspace=self.workspace,
+            email="pending@example.com",
+            role=WorkspaceMembership.ROLE_EDITOR,
+            token="pending-token-1234567890123456",
+            invited_by=self.owner,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+
+        viewer_client = Client(enforce_csrf_checks=True)
+        self._login_client(viewer_client, viewer.username, "VerySecurePass123")
+
+        response = viewer_client.get(f"/api/workspaces/{self.workspace.id}/invitations/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_accept_invitation_requires_matching_email(self):
+        invitation = WorkspaceInvitation.objects.create(
+            workspace=self.workspace,
+            email="invitee@example.com",
+            role=WorkspaceMembership.ROLE_EDITOR,
+            token="invite-token-1234567890",
+            invited_by=self.owner,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+
+        user_without_email = User.objects.create_user(
+            username="no-email-user",
+            email="",
+            password="VerySecurePass123",
+        )
+        client_without_email = Client(enforce_csrf_checks=True)
+        csrf = client_without_email.get("/api/auth/status/").cookies["csrftoken"].value
+        login_response = client_without_email.post(
+            "/api/auth/login/",
+            {"username": user_without_email.username, "password": "VerySecurePass123"},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=csrf,
+        )
+        self.assertEqual(login_response.status_code, 200)
+
+        accept_response = client_without_email.post(
+            "/api/workspaces/accept-invitation/",
+            {"token": invitation.token},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=client_without_email.get("/api/auth/status/").cookies["csrftoken"].value,
+        )
+        self.assertEqual(accept_response.status_code, 400)
+        self.assertIn("different email", accept_response.json()["detail"])
+
+    def test_accept_invitation_unauthenticated_response_omits_invitee_email(self):
+        invitation = WorkspaceInvitation.objects.create(
+            workspace=self.workspace,
+            email="private-invitee@example.com",
+            role=WorkspaceMembership.ROLE_EDITOR,
+            token="invite-token-private-1234567890",
+            invited_by=self.owner,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+        anonymous_client = Client()
+        response = anonymous_client.post(
+            "/api/workspaces/accept-invitation/",
+            {"token": invitation.token},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 401)
+        payload = response.json()
+        self.assertIn("workspace_name", payload)
+        self.assertNotIn("email", payload)
+
+    def test_decline_invitation_marks_pending_invites_declined(self):
+        invitation = WorkspaceInvitation.objects.create(
+            workspace=self.workspace,
+            email="decline@example.com",
+            role=WorkspaceMembership.ROLE_EDITOR,
+            token="decline-token-1234567890123456",
+            invited_by=self.owner,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+
+        anonymous_client = Client()
+        decline_response = anonymous_client.post(
+            "/api/workspaces/decline-invitation/",
+            {"token": invitation.token},
+            content_type="application/json",
+        )
+        self.assertEqual(decline_response.status_code, 200)
+        self.assertEqual(decline_response.json(), {"success": True})
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, WorkspaceInvitation.STATUS_DECLINED)
+        self.assertIsNotNone(invitation.accepted_at)
+
+    def test_decline_invitation_is_idempotent(self):
+        invitation = WorkspaceInvitation.objects.create(
+            workspace=self.workspace,
+            email="idempotent@example.com",
+            role=WorkspaceMembership.ROLE_EDITOR,
+            token="decline-idempotent-token-1234567890",
+            invited_by=self.owner,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+        invitation.status = WorkspaceInvitation.STATUS_DECLINED
+        invitation.accepted_at = timezone.now()
+        invitation.save(update_fields=["status", "accepted_at", "updated_at"])
+
+        anonymous_client = Client()
+        decline_response = anonymous_client.post(
+            "/api/workspaces/decline-invitation/",
+            {"token": invitation.token},
+            content_type="application/json",
+        )
+        self.assertEqual(decline_response.status_code, 200)
+        self.assertEqual(decline_response.json(), {"success": True})
+
+    def test_global_template_cannot_be_downgraded_by_workspace_user(self):
+        global_template = BlockTemplate.objects.create(
+            name="Global Hero",
+            is_global=True,
+            category=BlockTemplate.CATEGORY_HERO,
+            status=BlockTemplate.STATUS_PUBLISHED,
+        )
+
+        response = self.client.patch(
+            f"/api/block-templates/{global_template.id}/",
+            {"is_global": False, "site": self.site.id},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(response.status_code, 403)
+        global_template.refresh_from_db()
+        self.assertTrue(global_template.is_global)
+        self.assertIsNone(global_template.site_id)
+
+    def test_form_submissions_invalid_pagination_params_return_400(self):
+        form = Form.objects.create(site=self.site, name="Contact Form", slug="contact-form")
+        FormSubmission.objects.create(
+            site=self.site,
+            form_name=form.slug,
+            payload={"email": "contact@example.com"},
+        )
+
+        response = self.client.get(f"/api/forms/{form.id}/submissions/?page=abc")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("detail", response.json())
+
+        invalid_size = self.client.get(f"/api/forms/{form.id}/submissions/?page_size=500")
+        self.assertEqual(invalid_size.status_code, 400)
+        self.assertIn("page_size", invalid_size.json())
+
+    def test_form_submission_immutable_fields_cannot_be_overwritten(self):
+        submission = FormSubmission.objects.create(
+            site=self.site,
+            form_name="contact",
+            payload={"email": "first@example.com"},
+        )
+
+        update_response = self.client.patch(
+            f"/api/submissions/{submission.id}/",
+            {"payload": {"email": "tampered@example.com"}},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(update_response.status_code, 400)
+        self.assertIn("payload", update_response.json())
+
+        status_response = self.client.patch(
+            f"/api/submissions/{submission.id}/",
+            {"status": FormSubmission.STATUS_REVIEWED},
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(status_response.status_code, 200)
+        submission.refresh_from_db()
+        self.assertEqual(submission.status, FormSubmission.STATUS_REVIEWED)
+
+    def test_redirect_creation_blocks_unapproved_external_hosts(self):
+        response = self.client.post(
+            "/api/redirects/",
+            {
+                "site": self.site.id,
+                "source_path": "/docs",
+                "target_path": "https://evil.example/path",
+                "redirect_type": "301",
+            },
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not allowed", str(response.json()))
+
+    @override_settings(ALLOW_PRIVATE_WEBHOOK_TARGETS=False, DEBUG=False)
+    def test_webhook_secret_is_write_only_and_private_hosts_are_blocked(self):
+        private_host_response = self.client.post(
+            "/api/webhooks/",
+            {
+                "site": self.site.id,
+                "name": "Private Host Hook",
+                "url": "https://127.0.0.1/hook",
+                "event": "page.published",
+                "secret": "topsecret",
+            },
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(private_host_response.status_code, 400)
+        self.assertIn("private", str(private_host_response.json()).lower())
+
+    @override_settings(ALLOW_PRIVATE_WEBHOOK_TARGETS=False, DEBUG=False)
+    def test_webhook_blocks_internal_hostname_targets(self):
+        internal_host_response = self.client.post(
+            "/api/webhooks/",
+            {
+                "site": self.site.id,
+                "name": "Internal Host Hook",
+                "url": "https://service.internal/hook",
+                "event": "page.published",
+                "secret": "topsecret",
+            },
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(internal_host_response.status_code, 400)
+        self.assertIn("publicly routable", str(internal_host_response.json()).lower())
+
+    def test_webhook_secret_is_not_exposed_in_response(self):
+        response = self.client.post(
+            "/api/webhooks/",
+            {
+                "site": self.site.id,
+                "name": "Public Hook",
+                "url": "https://hooks.example.com/events",
+                "event": "page.published",
+                "secret": "ultra-secret",
+            },
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=self._csrf_token(),
+        )
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()
+        self.assertNotIn("secret", payload)
+        self.assertTrue(payload["has_secret"])
+
+
+class PerformanceAndReliabilityRegressionTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.owner = User.objects.create_user(
+            username="perf-owner",
+            email="perf-owner@example.com",
+            password="VerySecurePass123",
+        )
+        self.workspace = Workspace.objects.create(name="Perf Workspace", slug="perf-workspace", owner=self.owner)
+        WorkspaceMembership.objects.create(
+            workspace=self.workspace,
+            user=self.owner,
+            role=WorkspaceMembership.ROLE_OWNER,
+            invited_by=self.owner,
+            accepted_at=timezone.now(),
+        )
+        self.site = Site.objects.create(name="Perf Site", slug="perf-site", workspace=self.workspace)
+        self.client.force_login(self.owner)
+
+    def test_forms_list_avoids_n_plus_one_submission_count_queries(self):
+        for index in range(5):
+            form = Form.objects.create(
+                site=self.site,
+                name=f"Form {index}",
+                slug=f"form-{index}",
+            )
+            for submission_index in range(index + 1):
+                FormSubmission.objects.create(
+                    site=self.site,
+                    form_name=form.slug,
+                    payload={"n": submission_index},
+                )
+
+        with CaptureQueriesContext(connection) as query_context:
+            response = self.client.get(f"/api/forms/?site={self.site.id}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["count"], 5)
+        self.assertLessEqual(len(query_context), 20)
+        counts = {item["slug"]: item["submission_count"] for item in payload["results"]}
+        self.assertEqual(counts["form-0"], 1)
+        self.assertEqual(counts["form-4"], 5)
+
+    def test_trigger_webhooks_defers_queueing_until_transaction_commit(self):
+        from builder.services import trigger_webhooks
+
+        Webhook.objects.create(
+            site=self.site,
+            name="Deferred Hook",
+            url="https://hooks.example.com/deferred",
+            event=Webhook.EVENT_PAGE_PUBLISHED,
+            status=Webhook.STATUS_ACTIVE,
+        )
+
+        with mock.patch("builder.jobs.queue_webhook_delivery") as queue_delivery:
+            with self.captureOnCommitCallbacks(execute=True):
+                with transaction.atomic():
+                    trigger_webhooks(self.site, "page.published", {"page_id": 42})
+                    self.assertEqual(queue_delivery.call_count, 0)
+            self.assertEqual(queue_delivery.call_count, 1)

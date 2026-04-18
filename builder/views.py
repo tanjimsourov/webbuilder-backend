@@ -22,8 +22,7 @@ from rest_framework.views import APIView
 
 from cms.page_schema import extract_page_summary, extract_render_cache, normalize_page_content
 
-# TODO: In Phase 5, move all view logic into domain-specific apps. Temporarily
-# keep these runtime helpers imported from the monolith module.
+# Runtime helpers continue to live in this module during the app split.
 from .commerce_runtime import calculate_cart_pricing, shipping_country_for, shipping_state_for  # noqa: F401
 
 
@@ -195,6 +194,7 @@ from .localization import (
     sync_site_localization_settings,
 )
 from .mirror_import import import_mirrored_site
+from .jobs import queue_search_index
 from .serializers import (
     AuthBootstrapSerializer,
     AuthLoginSerializer,
@@ -715,7 +715,9 @@ class MetricsView(APIView):
             metrics_token = getattr(settings, "METRICS_AUTH_TOKEN", "")
             if not metrics_token:
                 raise Http404("Not available")
-            provided_token = request.headers.get("X-Metrics-Token") or request.query_params.get("token", "")
+            provided_token = request.headers.get("X-Metrics-Token") or ""
+            if not provided_token and getattr(settings, "METRICS_ALLOW_QUERY_TOKEN", False):
+                provided_token = request.query_params.get("token", "")
             if not provided_token or not secrets.compare_digest(str(provided_token), metrics_token):
                 raise Http404("Not available")
 
@@ -749,7 +751,9 @@ class MetricsView(APIView):
         except Exception:
             metrics["database_connected"] = False
 
-        return Response(metrics)
+        response = Response(metrics)
+        response["Cache-Control"] = "no-store"
+        return response
 
 
 class AuthMagicLoginView(APIView):
@@ -774,6 +778,8 @@ class AuthMagicLoginView(APIView):
 
         next_url = request.query_params.get("next") or ""
         if next_url:
+            if next_url.startswith("//"):
+                return Response({"detail": "Unsafe redirect target."}, status=status.HTTP_400_BAD_REQUEST)
             if url_has_allowed_host_and_scheme(
                 next_url,
                 allowed_hosts=set(settings.ALLOWED_HOSTS),
@@ -884,11 +890,11 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         page = super().perform_create(serializer)
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
 
     def perform_update(self, serializer):
         page = super().perform_update(serializer)
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
 
     @action(detail=True, methods=["post"])
     def save_builder(self, request, pk=None):
@@ -908,7 +914,7 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         page.status = Page.STATUS_DRAFT
         page.save()
         create_revision(page, "Draft snapshot")
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
         return Response(PageSerializer(page, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
@@ -930,7 +936,7 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         page.published_at = timezone.now()
         page.save()
         create_revision(page, "Published snapshot")
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
         trigger_webhooks(page.site, "page.published", {"page_id": page.id, "title": page.title, "path": page.path})
         return Response(PageSerializer(page, context={"request": request}).data)
 
@@ -977,16 +983,16 @@ class PageTranslationViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         translation = super().perform_create(serializer)
-        search_service.index_page(translation.page)
+        queue_search_index("page", translation.page_id)
 
     def perform_update(self, serializer):
         translation = super().perform_update(serializer)
-        search_service.index_page(translation.page)
+        queue_search_index("page", translation.page_id)
 
     def perform_destroy(self, instance):
         page = instance.page
         super().perform_destroy(instance)
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
 
     @action(detail=True, methods=["post"])
     def save_builder(self, request, pk=None):
@@ -1004,7 +1010,7 @@ class PageTranslationViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
         translation.status = PageTranslation.STATUS_DRAFT
         translation.save()
-        search_service.index_page(translation.page)
+        queue_search_index("page", translation.page_id)
         return Response(PageTranslationSerializer(translation, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
@@ -1024,7 +1030,7 @@ class PageTranslationViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         translation.status = PageTranslation.STATUS_PUBLISHED
         translation.published_at = timezone.now()
         translation.save()
-        search_service.index_page(translation.page)
+        queue_search_index("page", translation.page_id)
         trigger_webhooks(
             translation.page.site,
             "page.translation_published",
@@ -1388,11 +1394,11 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         asset = super().perform_create(serializer)
-        search_service.index_media(asset)
+        queue_search_index("media", asset.id)
 
     def perform_update(self, serializer):
         asset = super().perform_update(serializer)
-        search_service.index_media(asset)
+        queue_search_index("media", asset.id)
 
     def create(self, request, *args, **kwargs):
         """Override create to add file validation."""
@@ -1591,11 +1597,11 @@ class PostViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         post = super().perform_create(serializer)
-        search_service.index_post(post)
+        queue_search_index("post", post.id)
 
     def perform_update(self, serializer):
         post = super().perform_update(serializer)
-        search_service.index_post(post)
+        queue_search_index("post", post.id)
 
     @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):
@@ -1603,7 +1609,7 @@ class PostViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         post.status = Post.STATUS_PUBLISHED
         post.published_at = timezone.now()
         post.save(update_fields=["status", "published_at", "updated_at"])
-        search_service.index_post(post)
+        queue_search_index("post", post.id)
         trigger_webhooks(post.site, "post.published", {"post_id": post.id, "title": post.title, "slug": post.slug})
         return Response(PostSerializer(post, context={"request": request}).data)
 
@@ -1612,7 +1618,7 @@ class PostViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         post = self.get_object()
         post.status = Post.STATUS_DRAFT
         post.save(update_fields=["status", "updated_at"])
-        search_service.index_post(post)
+        queue_search_index("post", post.id)
         return Response(PostSerializer(post, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
@@ -1668,11 +1674,11 @@ class ProductViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         product = super().perform_create(serializer)
-        search_service.index_product(product)
+        queue_search_index("product", product.id)
 
     def perform_update(self, serializer):
         product = super().perform_update(serializer)
-        search_service.index_product(product)
+        queue_search_index("product", product.id)
 
     @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):
@@ -1680,7 +1686,7 @@ class ProductViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         product.status = Product.STATUS_PUBLISHED
         product.published_at = timezone.now()
         product.save(update_fields=["status", "published_at", "updated_at"])
-        search_service.index_product(product)
+        queue_search_index("product", product.id)
         return Response(ProductSerializer(product, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
@@ -1688,7 +1694,7 @@ class ProductViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         product = self.get_object()
         product.status = Product.STATUS_DRAFT
         product.save(update_fields=["status", "updated_at"])
-        search_service.index_product(product)
+        queue_search_index("product", product.id)
         return Response(ProductSerializer(product, context={"request": request}).data)
 
 
@@ -2736,6 +2742,8 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         template = serializer.instance
+        if template.is_global and not self.request.user.is_superuser:
+            raise PermissionDenied("Only platform administrators can modify global templates.")
         site = serializer.validated_data.get("site", template.site)
         is_global = bool(serializer.validated_data.get("is_global", template.is_global))
         self._validate_create_update_permissions(site=site, is_global=is_global)

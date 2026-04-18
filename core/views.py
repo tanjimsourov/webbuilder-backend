@@ -25,7 +25,12 @@ from cms.services import enqueue_site_revalidation
 from core.models import Site
 from domains.services import host_from_request, resolve_site_for_host
 from notifications.services import trigger_webhooks
-from builder.workspace_views import AcceptInvitationView, MyWorkspacesView, WorkspaceViewSet
+from builder.workspace_views import (
+    AcceptInvitationView,
+    DeclineInvitationView,
+    MyWorkspacesView,
+    WorkspaceViewSet,
+)
 
 
 class PublicRuntimeSiteMixin:
@@ -113,6 +118,7 @@ class SiteViewSet(BuilderSiteViewSet):
 
 __all__ = [
     "AcceptInvitationView",
+    "DeclineInvitationView",
     "DashboardSummaryView",
     "MyWorkspacesView",
     "PublicRuntimeSiteMixin",

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from django.conf import settings
+from django.core.cache import cache
 from django.http import HttpRequest
-from rest_framework import permissions, response, status, viewsets
+from rest_framework import mixins, permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 
@@ -28,7 +29,12 @@ class SubscriptionPlanViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny]
 
 
-class CustomerSubscriptionViewSet(viewsets.ModelViewSet):
+class CustomerSubscriptionViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
     serializer_class = CustomerSubscriptionSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -76,20 +82,39 @@ class CheckoutSessionView(APIView):
 class StripeWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
     authentication_classes: list = []
+    throttle_classes = []
+
+    def get_throttles(self):
+        from builder.throttles import WebhookThrottle
+
+        return [WebhookThrottle()]
 
     def post(self, request: HttpRequest):
         payload = request.body
         signature = request.META.get("HTTP_STRIPE_SIGNATURE", "")
         webhook_secret = settings.STRIPE_WEBHOOK_SECRET
-        if stripe and webhook_secret:
-            try:
-                event = stripe.Webhook.construct_event(payload=payload, sig_header=signature, secret=webhook_secret)
-            except stripe.error.SignatureVerificationError:
-                return response.Response({"detail": "Invalid signature."}, status=status.HTTP_400_BAD_REQUEST)
-            except ValueError:
-                return response.Response({"detail": "Invalid payload."}, status=status.HTTP_400_BAD_REQUEST)
-        else:
-            event = request.data
+        if not stripe or not webhook_secret:
+            return response.Response(
+                {"detail": "Stripe webhook processing is not configured."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if not signature:
+            return response.Response({"detail": "Missing signature."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            event = stripe.Webhook.construct_event(payload=payload, sig_header=signature, secret=webhook_secret)
+        except stripe.error.SignatureVerificationError:
+            return response.Response({"detail": "Invalid signature."}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError:
+            return response.Response({"detail": "Invalid payload."}, status=status.HTTP_400_BAD_REQUEST)
+
+        event_id = str(event.get("id") or "").strip()
+        if event_id:
+            cache_key = f"payments:stripe:webhook:{event_id}"
+            ttl_seconds = int(getattr(settings, "PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS", 604800) or 604800)
+            if not cache.add(cache_key, True, timeout=max(ttl_seconds, 1)):
+                return response.Response({"received": True, "duplicate": True})
+
         handle_webhook(event)
         return response.Response({"received": True})
 

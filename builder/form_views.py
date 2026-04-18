@@ -7,12 +7,15 @@ and public form submission with spam protection.
 
 import hashlib
 import time
+from django.db.models import Count, IntegerField, OuterRef, Subquery, Value
+from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse
 
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -29,7 +32,25 @@ class FormViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     serializer_class = FormSerializer
 
     def get_queryset(self):
-        qs = Form.objects.select_related("site").order_by("name")
+        submission_count_subquery = (
+            FormSubmission.objects.filter(
+                site_id=OuterRef("site_id"),
+                form_name=OuterRef("slug"),
+            )
+            .values("form_name")
+            .annotate(total=Count("id"))
+            .values("total")[:1]
+        )
+        qs = (
+            Form.objects.select_related("site")
+            .annotate(
+                submission_count_annotated=Coalesce(
+                    Subquery(submission_count_subquery, output_field=IntegerField()),
+                    Value(0),
+                )
+            )
+            .order_by("name")
+        )
         site_id = self.request.query_params.get("site")
         if site_id:
             qs = qs.filter(site_id=site_id)
@@ -67,16 +88,26 @@ class FormViewSet(SitePermissionMixin, viewsets.ModelViewSet):
             site=form.site,
             form_name=form.slug,
         ).order_by("-created_at")
-        
+
         # Pagination
-        page_size = int(request.query_params.get("page_size", 50))
-        page = int(request.query_params.get("page", 1))
+        page_size_raw = request.query_params.get("page_size", 50)
+        page_raw = request.query_params.get("page", 1)
+        try:
+            page_size = int(page_size_raw)
+            page = int(page_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"detail": "page and page_size must be integers."}) from exc
+        if page < 1:
+            raise ValidationError({"page": "page must be greater than or equal to 1."})
+        if page_size < 1 or page_size > 200:
+            raise ValidationError({"page_size": "page_size must be between 1 and 200."})
+
         start = (page - 1) * page_size
         end = start + page_size
-        
+
         total = submissions.count()
         submissions = submissions[start:end]
-        
+
         serializer = FormSubmissionSerializer(submissions, many=True, context={"request": request})
         return Response({
             "count": total,

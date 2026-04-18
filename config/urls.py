@@ -21,7 +21,6 @@ from commerce.views import (
 
 
 urlpatterns = [
-    path("admin/", admin.site.urls),
     path("api/", include("core.urls")),
     path("api/", include("cms.urls")),
     path("api/", include("blog.urls")),
@@ -55,6 +54,9 @@ urlpatterns = [
     re_path(r"^preview/(?P<site_slug>[-\w]+)/?$", public_page, {"page_path": ""}, name="preview-home"),
     re_path(r"^preview/(?P<site_slug>[-\w]+)/(?P<page_path>.*)$", public_page, name="preview-page"),
 ]
+
+if settings.ENABLE_ADMIN:
+    urlpatterns.insert(0, path("admin/", admin.site.urls))
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

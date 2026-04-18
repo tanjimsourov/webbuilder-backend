@@ -6,7 +6,7 @@ role changes, and access control.
 """
 
 from django.contrib.auth import get_user_model
-from django.db import models
+from django.db import models, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
@@ -15,6 +15,7 @@ import secrets
 
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -38,15 +39,37 @@ User = get_user_model()
 class WorkspaceViewSet(viewsets.ModelViewSet):
     """ViewSet for workspace management."""
     serializer_class = WorkspaceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _membership_for(self, workspace: Workspace):
+        return workspace.memberships.filter(user=self.request.user).first()
+
+    def _require_member_management(self, workspace: Workspace, *, owner_only: bool = False) -> None:
+        if self.request.user.is_superuser:
+            return
+        if workspace.owner_id == self.request.user.id:
+            return
+        membership = self._membership_for(workspace)
+        if not membership:
+            raise PermissionDenied("You don't have permission to access this workspace.")
+        if owner_only and membership.role != WorkspaceMembership.ROLE_OWNER:
+            raise PermissionDenied("Only workspace owners can perform this action.")
+        if not owner_only and not membership.can_manage_members:
+            raise PermissionDenied("You don't have permission to manage this workspace.")
 
     def get_queryset(self):
         user = self.request.user
         if not user.is_authenticated:
             return Workspace.objects.none()
-        # Return workspaces where user is owner or member
-        return Workspace.objects.filter(
-            models.Q(owner=user) | models.Q(memberships__user=user)
-        ).distinct().order_by("name")
+        return (
+            Workspace.objects.select_related("owner")
+            .prefetch_related("memberships")
+            .filter(models.Q(owner=user) | models.Q(memberships__user=user))
+            .annotate(member_count=models.Count("memberships", distinct=True))
+            .annotate(site_count=models.Count("sites", distinct=True))
+            .distinct()
+            .order_by("name")
+        )
 
     def perform_create(self, serializer):
         workspace = serializer.save(owner=self.request.user)
@@ -56,7 +79,23 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
             user=self.request.user,
             role=WorkspaceMembership.ROLE_OWNER,
             invited_by=self.request.user,
+            accepted_at=timezone.now(),
         )
+
+    def update(self, request, *args, **kwargs):
+        workspace = self.get_object()
+        self._require_member_management(workspace)
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        workspace = self.get_object()
+        self._require_member_management(workspace)
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        workspace = self.get_object()
+        self._require_member_management(workspace, owner_only=True)
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=["get"])
     def members(self, request, pk=None):
@@ -70,73 +109,99 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
     def invite(self, request, pk=None):
         """Invite a new member to the workspace."""
         workspace = self.get_object()
-
-        # Check permission
-        membership = workspace.memberships.filter(user=request.user).first()
-        if not membership or not membership.can_manage_members:
-            return Response(
-                {"detail": "You don't have permission to invite members."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        self._require_member_management(workspace)
 
         serializer = InviteMemberSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        email = serializer.validated_data["email"]
+        email = serializer.validated_data["email"].strip().lower()
         role = serializer.validated_data["role"]
+        if role == WorkspaceMembership.ROLE_OWNER:
+            return Response(
+                {"detail": "Invitations cannot grant owner role."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Check if user already exists and is a member
-        existing_user = User.objects.filter(email=email).first()
+        existing_user = User.objects.filter(email__iexact=email).first()
         if existing_user:
-            if workspace.memberships.filter(user=existing_user).exists():
+            now = timezone.now()
+            membership, created = WorkspaceMembership.objects.get_or_create(
+                workspace=workspace,
+                user=existing_user,
+                defaults={
+                    "role": role,
+                    "invited_by": request.user,
+                    "accepted_at": now,
+                },
+            )
+            if not created:
                 return Response(
                     {"detail": "This user is already a member of this workspace."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            # Add directly if user exists
-            new_membership = WorkspaceMembership.objects.create(
-                workspace=workspace,
-                user=existing_user,
-                role=role,
-                invited_by=request.user,
+
+            workspace.invitations.filter(
+                email=email,
+                status=WorkspaceInvitation.STATUS_PENDING,
+            ).update(
+                status=WorkspaceInvitation.STATUS_ACCEPTED,
+                accepted_at=now,
+                updated_at=now,
             )
             return Response(
-                WorkspaceMembershipSerializer(new_membership, context={"request": request}).data,
+                WorkspaceMembershipSerializer(membership, context={"request": request}).data,
                 status=status.HTTP_201_CREATED,
             )
 
-        # Create invitation for non-existing user
-        invitation = WorkspaceInvitation.objects.create(
-            workspace=workspace,
-            email=email,
-            role=role,
-            token=secrets.token_urlsafe(32),
-            invited_by=request.user,
-            expires_at=timezone.now() + timedelta(days=7),
+        now = timezone.now()
+        reused_invitation = False
+        invitation = (
+            workspace.invitations.filter(
+                email=email,
+                status=WorkspaceInvitation.STATUS_PENDING,
+                expires_at__gt=now,
+            )
+            .order_by("-created_at")
+            .first()
         )
+        if invitation:
+            reused_invitation = True
+            invitation.role = role
+            invitation.invited_by = request.user
+            invitation.expires_at = now + timedelta(days=7)
+            invitation.save(update_fields=["role", "invited_by", "expires_at", "updated_at"])
+        else:
+            invitation = WorkspaceInvitation.objects.create(
+                workspace=workspace,
+                email=email,
+                role=role,
+                token=secrets.token_urlsafe(32),
+                invited_by=request.user,
+                expires_at=now + timedelta(days=7),
+            )
         from .notification_services import notification_service
 
         notification_service.send_workspace_invitation(invitation, request.user.get_username())
 
         return Response(
             WorkspaceInvitationSerializer(invitation, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_200_OK if reused_invitation else status.HTTP_201_CREATED,
         )
 
     @action(detail=True, methods=["post"], url_path="members/(?P<member_id>[^/.]+)/role")
     def change_role(self, request, pk=None, member_id=None):
         """Change a member's role."""
         workspace = self.get_object()
-
-        # Check permission
-        current_membership = workspace.memberships.filter(user=request.user).first()
-        if not current_membership or not current_membership.can_manage_members:
-            return Response(
-                {"detail": "You don't have permission to change roles."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        self._require_member_management(workspace)
 
         target_membership = get_object_or_404(workspace.memberships, pk=member_id)
+
+        if target_membership.user_id == request.user.id:
+            return Response(
+                {"detail": "Use account settings to change your own role."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Cannot change owner's role
         if target_membership.role == WorkspaceMembership.ROLE_OWNER:
@@ -165,16 +230,15 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
     def remove_member(self, request, pk=None, member_id=None):
         """Remove a member from the workspace."""
         workspace = self.get_object()
-
-        # Check permission
-        current_membership = workspace.memberships.filter(user=request.user).first()
-        if not current_membership or not current_membership.can_manage_members:
-            return Response(
-                {"detail": "You don't have permission to remove members."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        self._require_member_management(workspace)
 
         target_membership = get_object_or_404(workspace.memberships, pk=member_id)
+
+        if target_membership.user_id == request.user.id:
+            return Response(
+                {"detail": "You cannot remove yourself from the workspace."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Cannot remove owner
         if target_membership.role == WorkspaceMembership.ROLE_OWNER:
@@ -190,6 +254,7 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
     def invitations(self, request, pk=None):
         """List pending invitations for a workspace."""
         workspace = self.get_object()
+        self._require_member_management(workspace)
         invitations = workspace.invitations.filter(
             status=WorkspaceInvitation.STATUS_PENDING
         ).order_by("-created_at")
@@ -200,14 +265,7 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
     def cancel_invitation(self, request, pk=None, invitation_id=None):
         """Cancel a pending invitation."""
         workspace = self.get_object()
-
-        # Check permission
-        membership = workspace.memberships.filter(user=request.user).first()
-        if not membership or not membership.can_manage_members:
-            return Response(
-                {"detail": "You don't have permission to cancel invitations."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        self._require_member_management(workspace)
 
         invitation = get_object_or_404(
             workspace.invitations,
@@ -240,73 +298,133 @@ class AcceptInvitationView(APIView):
         return [InvitationAcceptThrottle()]
 
     def post(self, request):
-        token = request.data.get("token")
+        token = str(request.data.get("token") or "").strip()
         if not token:
             return Response(
                 {"detail": "Invitation token is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        invitation = get_object_or_404(
-            WorkspaceInvitation,
-            token=token,
-            status=WorkspaceInvitation.STATUS_PENDING,
-        )
-
-        # Check if expired
-        if invitation.expires_at < timezone.now():
-            invitation.status = WorkspaceInvitation.STATUS_EXPIRED
-            invitation.save(update_fields=["status", "updated_at"])
+        if len(token) < 16:
             return Response(
-                {"detail": "This invitation has expired."},
+                {"detail": "Invitation token is invalid."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         # User must be authenticated
         if not request.user.is_authenticated:
+            invitation = get_object_or_404(
+                WorkspaceInvitation.objects.select_related("workspace"),
+                token=token,
+                status=WorkspaceInvitation.STATUS_PENDING,
+            )
             return Response(
                 {
                     "detail": "Please log in or create an account to accept this invitation.",
                     "workspace_name": invitation.workspace.name,
-                    "email": invitation.email,
                 },
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        # Check email matches (optional - can be relaxed)
-        if request.user.email and request.user.email.lower() != invitation.email.lower():
-            return Response(
-                {"detail": "This invitation was sent to a different email address."},
-                status=status.HTTP_400_BAD_REQUEST,
+        with transaction.atomic():
+            invitation = get_object_or_404(
+                WorkspaceInvitation.objects.select_related("workspace", "invited_by").select_for_update(),
+                token=token,
+                status=WorkspaceInvitation.STATUS_PENDING,
             )
 
-        # Create membership
-        membership, created = WorkspaceMembership.objects.get_or_create(
-            workspace=invitation.workspace,
-            user=request.user,
-            defaults={
-                "role": invitation.role,
-                "invited_by": invitation.invited_by,
-                "accepted_at": timezone.now(),
-            },
-        )
+            if invitation.expires_at < timezone.now():
+                invitation.status = WorkspaceInvitation.STATUS_EXPIRED
+                invitation.save(update_fields=["status", "updated_at"])
+                return Response(
+                    {"detail": "This invitation has expired."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        if not created:
-            return Response(
-                {"detail": "You are already a member of this workspace."},
-                status=status.HTTP_400_BAD_REQUEST,
+            user_email = (request.user.email or "").strip().lower()
+            if not user_email or user_email != invitation.email.lower():
+                return Response(
+                    {"detail": "This invitation was sent to a different email address."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            membership, created = WorkspaceMembership.objects.get_or_create(
+                workspace=invitation.workspace,
+                user=request.user,
+                defaults={
+                    "role": invitation.role,
+                    "invited_by": invitation.invited_by,
+                    "accepted_at": timezone.now(),
+                },
             )
+            if not created:
+                invitation.status = WorkspaceInvitation.STATUS_ACCEPTED
+                invitation.accepted_at = timezone.now()
+                invitation.save(update_fields=["status", "accepted_at", "updated_at"])
+                return Response(
+                    {
+                        "success": True,
+                        "workspace": WorkspaceSerializer(
+                            invitation.workspace,
+                            context={"request": request},
+                        ).data,
+                        "role": membership.role,
+                    }
+                )
 
-        # Mark invitation as accepted
-        invitation.status = WorkspaceInvitation.STATUS_ACCEPTED
-        invitation.accepted_at = timezone.now()
-        invitation.save(update_fields=["status", "accepted_at", "updated_at"])
+            invitation.status = WorkspaceInvitation.STATUS_ACCEPTED
+            invitation.accepted_at = timezone.now()
+            invitation.save(update_fields=["status", "accepted_at", "updated_at"])
 
         return Response({
             "success": True,
             "workspace": WorkspaceSerializer(invitation.workspace, context={"request": request}).data,
             "role": membership.role,
         })
+
+
+class DeclineInvitationView(APIView):
+    """Decline a workspace invitation token."""
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import InvitationAcceptThrottle
+
+        return [InvitationAcceptThrottle()]
+
+    def post(self, request):
+        token = str(request.data.get("token") or "").strip()
+        if not token:
+            return Response(
+                {"detail": "Invitation token is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(token) < 16:
+            return Response(
+                {"detail": "Invitation token is invalid."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            invitation = (
+                WorkspaceInvitation.objects.select_for_update()
+                .filter(token=token)
+                .first()
+            )
+            if not invitation:
+                return Response({"success": True})
+            if invitation.status != WorkspaceInvitation.STATUS_PENDING:
+                return Response({"success": True})
+            if invitation.expires_at < timezone.now():
+                invitation.status = WorkspaceInvitation.STATUS_EXPIRED
+                invitation.save(update_fields=["status", "updated_at"])
+                return Response({"success": True})
+
+            invitation.status = WorkspaceInvitation.STATUS_DECLINED
+            invitation.accepted_at = timezone.now()
+            invitation.save(update_fields=["status", "accepted_at", "updated_at"])
+
+        return Response({"success": True})
 
 
 class MyWorkspacesView(APIView):
@@ -316,9 +434,15 @@ class MyWorkspacesView(APIView):
         if not request.user.is_authenticated:
             return Response({"detail": "Authentication required."}, status=status.HTTP_401_UNAUTHORIZED)
 
-        workspaces = Workspace.objects.filter(
-            models.Q(owner=request.user) | models.Q(memberships__user=request.user)
-        ).distinct().order_by("name")
+        workspaces = (
+            Workspace.objects.select_related("owner")
+            .prefetch_related("memberships")
+            .filter(models.Q(owner=request.user) | models.Q(memberships__user=request.user))
+            .annotate(member_count=models.Count("memberships", distinct=True))
+            .annotate(site_count=models.Count("sites", distinct=True))
+            .distinct()
+            .order_by("name")
+        )
 
         serializer = WorkspaceSerializer(workspaces, many=True, context={"request": request})
         return Response(serializer.data)

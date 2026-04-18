@@ -1,5 +1,8 @@
 from decimal import Decimal
+import ipaddress
+from urllib.parse import urlparse
 
+from django.conf import settings
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
@@ -540,8 +543,15 @@ class PageReviewSerializer(serializers.ModelSerializer):
             if request and request.user and request.user.is_authenticated:
                 return CollaboratorUserSerializer([request.user], many=True).data
             return []
+        cache = self.context.setdefault("_workspace_collaborator_cache", {})
+        cache_key = workspace.id
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
         memberships = workspace.memberships.select_related("user").order_by("role", "user__username")
-        return CollaboratorUserSerializer([membership.user for membership in memberships], many=True).data
+        payload = CollaboratorUserSerializer([membership.user for membership in memberships], many=True).data
+        cache[cache_key] = payload
+        return payload
 
     def get_stats(self, obj: PageReview) -> dict[str, object]:
         comments = list(obj.comments.all())
@@ -1105,6 +1115,9 @@ class FormSerializer(serializers.ModelSerializer):
         ]
 
     def get_submission_count(self, obj) -> int:
+        annotated_count = getattr(obj, "submission_count_annotated", None)
+        if annotated_count is not None:
+            return int(annotated_count)
         return FormSubmission.objects.filter(site=obj.site, form_name=obj.slug).count()
 
     def validate(self, attrs):
@@ -1423,10 +1436,29 @@ class FormSubmissionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+        read_only_fields = ["created_at", "updated_at", "page_title"]
 
     def validate(self, attrs):
         site = attrs.get("site") or getattr(self.instance, "site", None)
         page = attrs.get("page") or getattr(self.instance, "page", None)
+        if self.instance:
+            immutable_changes = {}
+            if "site" in attrs:
+                new_site_id = attrs["site"].pk if attrs["site"] is not None else None
+                if new_site_id != self.instance.site_id:
+                    immutable_changes["site"] = "This field cannot be modified after creation."
+            if "page" in attrs:
+                new_page_id = attrs["page"].pk if attrs["page"] is not None else None
+                if new_page_id != self.instance.page_id:
+                    immutable_changes["page"] = "This field cannot be modified after creation."
+            if "form_name" in attrs and attrs["form_name"] != self.instance.form_name:
+                immutable_changes["form_name"] = "This field cannot be modified after creation."
+            if "payload" in attrs and attrs["payload"] != self.instance.payload:
+                immutable_changes["payload"] = "This field cannot be modified after creation."
+            if immutable_changes:
+                raise serializers.ValidationError(immutable_changes)
+        if not site:
+            raise serializers.ValidationError({"site": "Site is required."})
         if page and page.site_id != site.id:
             raise serializers.ValidationError({"page": "Selected page must belong to the same site."})
         return attrs
@@ -1615,7 +1647,13 @@ class PublicCommentSubmissionSerializer(serializers.Serializer):
     post_slug = serializers.SlugField(max_length=180)
     author_name = serializers.CharField(max_length=140)
     author_email = serializers.EmailField()
-    body = serializers.CharField()
+    body = serializers.CharField(max_length=5000)
+
+    def validate_body(self, value: str) -> str:
+        normalized = (value or "").strip()
+        if not normalized:
+            raise serializers.ValidationError("Comment body cannot be empty.")
+        return normalized
 
 
 class SiteBlueprintSectionSerializer(serializers.Serializer):
@@ -1771,12 +1809,54 @@ class URLRedirectSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        source = attrs.get("source_path", "").strip()
-        target = attrs.get("target_path", "").strip()
-        if source and not source.startswith("/"):
-            attrs["source_path"] = f"/{source}"
-        if target and not target.startswith("/") and not target.startswith("http"):
-            attrs["target_path"] = f"/{target}"
+        source_raw = attrs.get("source_path", getattr(self.instance, "source_path", ""))
+        target_raw = attrs.get("target_path", getattr(self.instance, "target_path", ""))
+
+        source = (source_raw or "").strip()
+        target = (target_raw or "").strip()
+        if not source:
+            raise serializers.ValidationError({"source_path": "Source path is required."})
+        if not target:
+            raise serializers.ValidationError({"target_path": "Target path is required."})
+
+        if not source.startswith("/"):
+            source = f"/{source}"
+        if source.startswith("//"):
+            raise serializers.ValidationError({"source_path": "Source path cannot start with //."})
+        if "?" in source or "#" in source:
+            raise serializers.ValidationError({"source_path": "Source path cannot include query strings or fragments."})
+
+        if target.startswith("/"):
+            if target.startswith("//"):
+                raise serializers.ValidationError({"target_path": "Target path cannot start with //."})
+            attrs["source_path"] = source
+            attrs["target_path"] = target
+            return attrs
+
+        parsed = urlparse(target)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise serializers.ValidationError(
+                {"target_path": "Target must be a relative path or an absolute http(s) URL."}
+            )
+        if parsed.username or parsed.password:
+            raise serializers.ValidationError({"target_path": "Target URL cannot include credentials."})
+        if parsed.scheme != "https" and not settings.DEBUG:
+            raise serializers.ValidationError({"target_path": "External redirect URLs must use https."})
+
+        host = (parsed.hostname or "").strip().lower()
+        allowed_external_hosts = {h.lower() for h in getattr(settings, "REDIRECT_ALLOWED_EXTERNAL_HOSTS", [])}
+        if host not in allowed_external_hosts:
+            raise serializers.ValidationError(
+                {
+                    "target_path": (
+                        "External redirect host is not allowed. "
+                        "Add it to DJANGO_REDIRECT_ALLOWED_EXTERNAL_HOSTS if this is intentional."
+                    )
+                }
+            )
+
+        attrs["source_path"] = source
+        attrs["target_path"] = target
         return attrs
 
 
@@ -1948,6 +2028,8 @@ class NavigationMenuSerializer(serializers.ModelSerializer):
 
 
 class WebhookSerializer(serializers.ModelSerializer):
+    has_secret = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Webhook
         fields = [
@@ -1961,10 +2043,60 @@ class WebhookSerializer(serializers.ModelSerializer):
             "last_triggered_at",
             "success_count",
             "failure_count",
+            "has_secret",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["last_triggered_at", "success_count", "failure_count"]
+        read_only_fields = ["last_triggered_at", "success_count", "failure_count", "has_secret"]
+        extra_kwargs = {
+            "secret": {"write_only": True, "required": False, "allow_blank": True},
+        }
+
+    def get_has_secret(self, obj) -> bool:
+        return bool(obj.secret)
+
+    def validate_url(self, value: str) -> str:
+        normalized_value = (value or "").strip()
+        parsed = urlparse(normalized_value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise serializers.ValidationError("Webhook URL must be an absolute http(s) URL.")
+        if parsed.username or parsed.password:
+            raise serializers.ValidationError("Webhook URL cannot include credentials.")
+        if parsed.scheme != "https" and not settings.DEBUG:
+            raise serializers.ValidationError("Webhook URL must use https in production.")
+
+        allow_private_targets = getattr(settings, "ALLOW_PRIVATE_WEBHOOK_TARGETS", settings.DEBUG)
+        hostname = (parsed.hostname or "").strip().lower()
+        if hostname in {"localhost", "127.0.0.1", "::1"}:
+            if not allow_private_targets:
+                raise serializers.ValidationError(
+                    "Webhook URL host is not allowed. Set DJANGO_ALLOW_PRIVATE_WEBHOOK_TARGETS=true to override."
+                )
+
+        try:
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            normalized_hostname = hostname.rstrip(".")
+            if not allow_private_targets and normalized_hostname:
+                local_suffixes = (".local", ".internal", ".localhost", ".home", ".lan")
+                if "." not in normalized_hostname or normalized_hostname.endswith(local_suffixes):
+                    raise serializers.ValidationError(
+                        "Webhook URL host must be publicly routable. "
+                        "Set DJANGO_ALLOW_PRIVATE_WEBHOOK_TARGETS=true to override."
+                    )
+            return normalized_value
+
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+        ) and not allow_private_targets:
+            raise serializers.ValidationError(
+                "Webhook URL host is private or loopback. Set DJANGO_ALLOW_PRIVATE_WEBHOOK_TARGETS=true to override."
+            )
+        return normalized_value
 
 
 class SearchConsoleCredentialSerializer(serializers.ModelSerializer):
@@ -2174,17 +2306,32 @@ class WorkspaceSerializer(serializers.ModelSerializer):
         read_only_fields = ["owner", "is_personal"]
 
     def get_member_count(self, obj) -> int:
+        annotated = getattr(obj, "member_count", None)
+        if annotated is not None:
+            return int(annotated)
         return obj.memberships.count()
 
     def get_site_count(self, obj) -> int:
+        annotated = getattr(obj, "site_count", None)
+        if annotated is not None:
+            return int(annotated)
         return obj.sites.count()
 
     def get_current_user_role(self, obj) -> str | None:
         request = self.context.get("request")
         if not request or not request.user.is_authenticated:
             return None
+        if obj.owner_id == request.user.id:
+            return WorkspaceMembership.ROLE_OWNER
         membership = obj.memberships.filter(user=request.user).first()
         return membership.role if membership else None
+
+    def validate_settings(self, value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Workspace settings must be a JSON object.")
+        return value
 
     def validate_slug(self, value):
         query = Workspace.objects.filter(slug=value)
@@ -2199,6 +2346,11 @@ class InviteMemberSerializer(serializers.Serializer):
     """Serializer for inviting a new member to a workspace."""
     email = serializers.EmailField()
     role = serializers.ChoiceField(choices=WorkspaceMembership.ROLE_CHOICES, default=WorkspaceMembership.ROLE_EDITOR)
+
+    def validate_role(self, value: str) -> str:
+        if value == WorkspaceMembership.ROLE_OWNER:
+            raise serializers.ValidationError("Invitations cannot grant owner role.")
+        return value
 
 
 class ChangeMemberRoleSerializer(serializers.Serializer):

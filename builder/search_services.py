@@ -6,6 +6,9 @@ Uses Meilisearch for fast, typo-tolerant search with faceting.
 """
 
 import logging
+import os
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -23,9 +26,14 @@ class SearchService:
         """Initialize Meilisearch client if configured."""
         self.client = None
         self.enabled = False
+        self._setup_lock = threading.Lock()
+        self._settings_last_synced_at = 0.0
+        self._settings_sync_interval_seconds = max(
+            60,
+            int(os.environ.get("MEILISEARCH_SETTINGS_SYNC_INTERVAL_SECONDS", "300") or "300"),
+        )
         
         try:
-            import os
             from meilisearch import Client
             
             host = os.environ.get('MEILISEARCH_HOST', 'http://127.0.0.1:7700')
@@ -254,12 +262,20 @@ class SearchService:
             logger.error(f"Failed to delete document {doc_id}: {e}")
             return False
     
-    def setup_indexes(self) -> bool:
+    def setup_indexes(self, *, force: bool = False) -> bool:
         """Set up search indexes with proper settings."""
         if not self.enabled:
             return False
+        now = time.monotonic()
+        if not force and (now - self._settings_last_synced_at) < self._settings_sync_interval_seconds:
+            return True
+        if not self._setup_lock.acquire(blocking=False):
+            return True
         
         try:
+            now = time.monotonic()
+            if not force and (now - self._settings_last_synced_at) < self._settings_sync_interval_seconds:
+                return True
             # Pages index
             pages_index = self.client.index('pages')
             pages_index.update_settings({
@@ -297,10 +313,13 @@ class SearchService:
             })
             
             logger.info("Search indexes configured successfully")
+            self._settings_last_synced_at = time.monotonic()
             return True
         except Exception as e:
             logger.error(f"Failed to setup indexes: {e}")
             return False
+        finally:
+            self._setup_lock.release()
     
     def _extract_text_from_html(self, html: str) -> str:
         """Extract plain text from HTML for indexing."""

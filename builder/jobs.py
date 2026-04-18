@@ -21,6 +21,8 @@ import traceback
 from datetime import timedelta
 from typing import Any, Callable
 
+from django.core.cache import cache
+from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -72,14 +74,17 @@ def create_job(
     if existing:
         return existing
 
-    return Job.objects.create(
-        job_type=job_type,
-        job_id=job_id,
-        payload=payload,
-        scheduled_at=scheduled_at or timezone.now(),
-        priority=priority,
-        max_retries=max_retries,
-    )
+    try:
+        return Job.objects.create(
+            job_type=job_type,
+            job_id=job_id,
+            payload=payload,
+            scheduled_at=scheduled_at or timezone.now(),
+            priority=priority,
+            max_retries=max_retries,
+        )
+    except IntegrityError:
+        return Job.objects.get(job_id=job_id)
 
 
 def schedule_publish(
@@ -106,12 +111,8 @@ def queue_webhook_delivery(
     payload: dict,
 ) -> WebhookDelivery:
     """Queue a webhook for delivery."""
-    from .models import Webhook
-
-    webhook = Webhook.objects.get(pk=webhook_id)
-
     delivery = WebhookDelivery.objects.create(
-        webhook=webhook,
+        webhook_id=webhook_id,
         event=event,
         payload=payload,
         next_attempt_at=timezone.now(),
@@ -126,6 +127,29 @@ def queue_webhook_delivery(
     )
 
     return delivery
+
+
+def queue_search_index(
+    object_type: str,
+    object_id: int,
+    *,
+    operation: str = "upsert",
+    priority: int = Job.PRIORITY_NORMAL,
+) -> Job:
+    """Queue a search indexing job for eventual consistency off the request path."""
+    normalized_type = str(object_type or "").strip().lower()
+    normalized_operation = str(operation or "upsert").strip().lower()
+    dedupe_bucket = int(time.time() // 60)
+    return create_job(
+        job_type="search_index",
+        payload={
+            "object_type": normalized_type,
+            "object_id": int(object_id),
+            "operation": normalized_operation,
+        },
+        priority=priority,
+        idempotency_key=f"{normalized_type}:{int(object_id)}:{normalized_operation}:{dedupe_bucket}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,28 +275,101 @@ def handle_runtime_revalidate(job: Job) -> dict:
     return process_runtime_revalidation_job(job.payload)
 
 
+@register_job("search_index")
+def handle_search_index(job: Job) -> dict:
+    """Index or remove a document from Meilisearch."""
+    from .models import MediaAsset, Page, Post, Product
+    from .search_services import search_service
+
+    object_type = str(job.payload.get("object_type") or "").strip().lower()
+    operation = str(job.payload.get("operation") or "upsert").strip().lower()
+    object_id = int(job.payload.get("object_id") or 0)
+    if object_id <= 0:
+        return {"error": "Invalid object_id"}
+
+    if operation == "delete":
+        index_map = {
+            "page": "pages",
+            "post": "posts",
+            "product": "products",
+            "media": "media",
+        }
+        index_name = index_map.get(object_type)
+        if not index_name:
+            return {"error": f"Unsupported object_type: {object_type}"}
+        deleted = search_service.delete_document(index_name, f"{object_type}_{object_id}")
+        return {"deleted": bool(deleted), "object_type": object_type, "object_id": object_id}
+
+    if object_type == "page":
+        page = Page.objects.select_related("site").filter(pk=object_id).first()
+        if not page:
+            return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
+        indexed = search_service.index_page(page)
+        return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
+
+    if object_type == "post":
+        post = (
+            Post.objects.select_related("site")
+            .prefetch_related("categories", "tags")
+            .filter(pk=object_id)
+            .first()
+        )
+        if not post:
+            return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
+        indexed = search_service.index_post(post)
+        return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
+
+    if object_type == "product":
+        product = (
+            Product.objects.select_related("site")
+            .prefetch_related("categories", "variants")
+            .filter(pk=object_id)
+            .first()
+        )
+        if not product:
+            return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
+        indexed = search_service.index_product(product)
+        return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
+
+    if object_type == "media":
+        media = MediaAsset.objects.select_related("site").filter(pk=object_id).first()
+        if not media:
+            return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
+        indexed = search_service.index_media(media)
+        return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
+
+    return {"error": f"Unsupported object_type: {object_type}"}
+
+
 @register_job("deliver_webhook")
 def handle_deliver_webhook(job: Job) -> dict:
     """Deliver a webhook."""
-    import requests
+    from urllib import error as urllib_error
+    from urllib import request as urllib_request
 
     delivery_id = job.payload.get("delivery_id")
     if not delivery_id:
         return {"error": "No delivery_id in payload"}
 
+    lock_key = f"webhook_delivery_lock:{delivery_id}"
+    if not cache.add(lock_key, True, timeout=120):
+        return {"skipped": True, "reason": "Delivery is already being processed"}
+
     try:
         delivery = WebhookDelivery.objects.select_related("webhook").get(pk=delivery_id)
     except WebhookDelivery.DoesNotExist:
+        cache.delete(lock_key)
         return {"error": f"Delivery {delivery_id} not found"}
 
-    if delivery.status == WebhookDelivery.STATUS_DELIVERED:
-        return {"skipped": True, "reason": "Already delivered"}
-
     webhook = delivery.webhook
-    delivery.attempt_count += 1
-    delivery.last_attempt_at = timezone.now()
 
     try:
+        if delivery.status == WebhookDelivery.STATUS_DELIVERED:
+            return {"skipped": True, "reason": "Already delivered"}
+
+        delivery.attempt_count += 1
+        delivery.last_attempt_at = timezone.now()
+
         # Prepare headers
         headers = {
             "Content-Type": "application/json",
@@ -293,30 +390,40 @@ def handle_deliver_webhook(job: Job) -> dict:
 
         # Send request
         start_time = time.time()
-        response = requests.post(
+        body = json.dumps(delivery.payload).encode("utf-8")
+        req = urllib_request.Request(
             webhook.url,
-            json=delivery.payload,
+            data=body,
             headers=headers,
-            timeout=30,
+            method="POST",
         )
+        status_code = 0
+        response_text = ""
+        try:
+            with urllib_request.urlopen(req, timeout=30) as response:
+                status_code = int(response.status)
+                response_text = response.read().decode("utf-8", errors="replace")
+        except urllib_error.HTTPError as exc:
+            status_code = int(exc.code)
+            response_text = exc.read().decode("utf-8", errors="replace")
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        delivery.response_status = response.status_code
-        delivery.response_body = response.text[:5000]  # Limit stored response
+        delivery.response_status = status_code
+        delivery.response_body = response_text[:5000]
         delivery.response_time_ms = elapsed_ms
 
-        if 200 <= response.status_code < 300:
+        if 200 <= status_code < 300:
             delivery.status = WebhookDelivery.STATUS_DELIVERED
             webhook.success_count += 1
             webhook.last_triggered_at = timezone.now()
-            webhook.save(update_fields=["success_count", "last_triggered_at"])
+            webhook.save(update_fields=["success_count", "last_triggered_at", "updated_at"])
         else:
-            raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+            raise RuntimeError(f"HTTP {status_code}: {response_text[:200]}")
 
     except Exception as e:
         delivery.error_message = str(e)
         webhook.failure_count += 1
-        webhook.save(update_fields=["failure_count"])
+        webhook.save(update_fields=["failure_count", "updated_at"])
 
         # Schedule retry if attempts remaining
         if delivery.attempt_count < delivery.max_attempts:
@@ -334,8 +441,9 @@ def handle_deliver_webhook(job: Job) -> dict:
             )
         else:
             delivery.status = WebhookDelivery.STATUS_FAILED
-
-    delivery.save()
+    finally:
+        delivery.save()
+        cache.delete(lock_key)
 
     return {
         "delivered": delivery.status == WebhookDelivery.STATUS_DELIVERED,
@@ -371,29 +479,53 @@ def handle_run_seo_audit(job: Job) -> dict:
 # Job Runner
 # ---------------------------------------------------------------------------
 
+def _claim_pending_jobs(batch_size: int) -> list[Job]:
+    """Claim pending jobs using row-level locks to prevent duplicate workers."""
+    now = timezone.now()
+    with transaction.atomic():
+        queryset = (
+            Job.objects.filter(status=Job.STATUS_PENDING, scheduled_at__lte=now)
+            .order_by("-priority", "scheduled_at", "id")
+        )
+        if connection.features.has_select_for_update:
+            select_kwargs: dict[str, bool] = {}
+            if connection.features.has_select_for_update_skip_locked:
+                select_kwargs["skip_locked"] = True
+            queryset = queryset.select_for_update(**select_kwargs)
+        jobs = list(queryset[:batch_size])
+        if not jobs:
+            return []
+        claim_time = timezone.now()
+        for job in jobs:
+            job.status = Job.STATUS_RUNNING
+            job.started_at = claim_time
+            job.updated_at = claim_time
+        Job.objects.bulk_update(jobs, ["status", "started_at", "updated_at"])
+    return jobs
+
+
 def process_pending_jobs(batch_size: int = 10) -> int:
     """Process pending jobs that are due."""
-    now = timezone.now()
-
-    # Get jobs that are ready to run
-    jobs = Job.objects.filter(
-        status=Job.STATUS_PENDING,
-        scheduled_at__lte=now,
-    ).order_by("-priority", "scheduled_at")[:batch_size]
+    jobs = _claim_pending_jobs(batch_size=batch_size)
 
     processed = 0
 
     for job in jobs:
         try:
-            process_job(job)
+            process_job(job, already_running=True)
             processed += 1
-        except Exception as e:
-            logger.error(f"Error processing job {job.job_id}: {e}")
+        except Exception:
+            logger.exception("Unhandled error processing claimed job %s", job.job_id)
+            Job.objects.filter(pk=job.pk).update(
+                status=Job.STATUS_FAILED,
+                completed_at=timezone.now(),
+                last_error="Unhandled processor exception.",
+            )
 
     return processed
 
 
-def process_job(job: Job) -> None:
+def process_job(job: Job, *, already_running: bool = False) -> None:
     """Process a single job."""
     handler = get_job_handler(job.job_type)
     if not handler:
@@ -402,10 +534,11 @@ def process_job(job: Job) -> None:
         job.save(update_fields=["status", "last_error", "updated_at"])
         return
 
-    # Mark as running
-    job.status = Job.STATUS_RUNNING
-    job.started_at = timezone.now()
-    job.save(update_fields=["status", "started_at", "updated_at"])
+    if not already_running:
+        # Mark as running
+        job.status = Job.STATUS_RUNNING
+        job.started_at = timezone.now()
+        job.save(update_fields=["status", "started_at", "updated_at"])
 
     try:
         result = handler(job)

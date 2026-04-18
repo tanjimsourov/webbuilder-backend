@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -438,6 +439,18 @@ class PaymentService:
 
         # Parse event
         event = gateway.parse_webhook_event(payload)
+        event_id = str(event.get("id", "")).strip()
+        if event_id:
+            ttl_seconds = int(getattr(settings, "PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS", 604800) or 604800)
+            cache_key = f"payment:webhook:{provider.value}:{event_id}"
+            if not cache.add(cache_key, True, timeout=max(ttl_seconds, 1)):
+                logger.info("Skipping duplicate payment webhook event %s for provider %s", event_id, provider.value)
+                return {
+                    "type": event.get("type", ""),
+                    "id": event_id,
+                    "data": event.get("data", {}),
+                    "duplicate": True,
+                }
 
         # Handle specific event types
         event_type = event.get("type", "")

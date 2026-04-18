@@ -32,7 +32,25 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      DJANGO_RUN_MIGRATIONS: "0"
+      DJANGO_COLLECTSTATIC: "0"
     command: celery -A config worker -l info
+    depends_on:
+      - redis
+    volumes:
+      - ./media:/app/media
+    restart: unless-stopped
+
+  job-runner:
+    container_name: smc-job-runner
+    build: .
+    env_file:
+      - .env
+    environment:
+      DJANGO_RUN_MIGRATIONS: "0"
+      DJANGO_COLLECTSTATIC: "0"
+    command: python manage.py run_jobs --daemon --interval 5 --batch-size 20
     depends_on:
       - redis
     volumes:

@@ -53,7 +53,6 @@ def create_checkout_session(
                 "price_data": {
                     "currency": plan.currency.lower(),
                     "unit_amount": plan.amount,
-                    "recurring": {"interval": plan.interval},
                     "product_data": {
                         "name": plan.name,
                         "description": plan.description or "",

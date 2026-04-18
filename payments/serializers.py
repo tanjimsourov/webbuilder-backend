@@ -48,7 +48,15 @@ class CustomerSubscriptionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at"]
+        read_only_fields = [
+            "customer",
+            "workspace",
+            "stripe_subscription_id",
+            "status",
+            "current_period_end",
+            "created_at",
+            "updated_at",
+        ]
 
 
 class InvoiceSerializer(serializers.ModelSerializer):

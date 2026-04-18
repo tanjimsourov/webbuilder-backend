@@ -103,6 +103,24 @@ class SettingsValidationTests(TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("DJANGO_CACHE_URL must be set in production", result.stderr + result.stdout)
 
+    def test_production_fails_when_metrics_query_token_is_enabled(self):
+        env = _base_production_env()
+        env["DJANGO_METRICS_ALLOW_QUERY_TOKEN"] = "true"
+
+        result = _run_manage_check(env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DJANGO_METRICS_ALLOW_QUERY_TOKEN must be false in production", result.stderr + result.stdout)
+
+    def test_production_fails_when_magic_login_is_enabled(self):
+        env = _base_production_env()
+        env["DJANGO_AUTH_MAGIC_LOGIN_ENABLED"] = "true"
+
+        result = _run_manage_check(env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DJANGO_AUTH_MAGIC_LOGIN_ENABLED must be false in production", result.stderr + result.stdout)
+
     def test_production_check_passes_with_required_configuration(self):
         result = _run_manage_check(_base_production_env())
 

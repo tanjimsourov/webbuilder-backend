@@ -32,8 +32,8 @@ from builder.views import (
     public_robots,
     public_sitemap,
 )
+from builder.jobs import queue_search_index
 from builder.serializers import BuilderSaveSerializer
-from builder.search_services import search_service
 from cms.serializers import (
     PublicRuntimeMenuSerializer,
     PublicRuntimePageSerializer,
@@ -79,7 +79,7 @@ class PageViewSet(BuilderPageViewSet):
         except DjangoValidationError as exc:
             detail = exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}
             raise ValidationError(detail)
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
         serializer = self.get_serializer(result["page"])
         return Response(serializer.data)
 
@@ -87,7 +87,7 @@ class PageViewSet(BuilderPageViewSet):
     def unpublish(self, request, pk=None):
         page = self.get_object()
         result = unpublish_page_content(page, actor=str(request.user), reason="manual_unpublish")
-        search_service.index_page(page)
+        queue_search_index("page", page.id)
         serializer = self.get_serializer(result["page"])
         return Response(serializer.data)
 

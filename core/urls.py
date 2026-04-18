@@ -8,6 +8,7 @@ from rest_framework.routers import SimpleRouter
 from core.views import (
     AcceptInvitationView,
     DashboardSummaryView,
+    DeclineInvitationView,
     MyWorkspacesView,
     SiteLocaleViewSet,
     SiteViewSet,
@@ -25,5 +26,6 @@ urlpatterns = [
     path("search/", WorkspaceSearchView.as_view(), name="workspace-search"),
     path("workspaces/my/", MyWorkspacesView.as_view(), name="my-workspaces"),
     path("workspaces/accept-invitation/", AcceptInvitationView.as_view(), name="accept-invitation"),
+    path("workspaces/decline-invitation/", DeclineInvitationView.as_view(), name="decline-invitation"),
     path("", include(router.urls)),
 ]
