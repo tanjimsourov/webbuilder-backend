@@ -1,0 +1,40 @@
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+version-template: "$MAJOR.$MINOR.$PATCH"
+change-template: "- $TITLE (#$NUMBER) @$AUTHOR"
+template: |
+  ## Changes
+
+  $CHANGES
+
+categories:
+  - title: "🚀 Features"
+    labels: ["feature", "enhancement"]
+  - title: "🐛 Fixes"
+    labels: ["fix", "bug"]
+  - title: "🔐 Security"
+    labels: ["security"]
+  - title: "⚙️ Operations"
+    labels: ["ops", "devops", "ci"]
+  - title: "📝 Docs"
+    labels: ["docs"]
+
+exclude-labels:
+  - "skip-changelog"
+
+autolabeler:
+  - label: "docs"
+    files:
+      - "*.md"
+      - "docs/**"
+      - "deploy/**"
+      - "ops/**"
+  - label: "ci"
+    files:
+      - ".github/**"
+  - label: "security"
+    files:
+      - "SECURITY.md"
+      - "SECURITY_BASELINE.md"
+      - "shared/auth/**"
+      - "shared/http/security_headers.py"

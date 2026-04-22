@@ -26,7 +26,7 @@ from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from .models import Job, WebhookDelivery
+from .models import AutomationWebhookDelivery, Job, WebhookDelivery
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,28 @@ def queue_webhook_delivery(
         idempotency_key=f"webhook:{delivery.id}",
     )
 
+    return delivery
+
+
+def queue_automation_webhook_delivery(
+    webhook_id: int,
+    event: str,
+    payload: dict,
+) -> AutomationWebhookDelivery:
+    """Queue an automation webhook for delivery."""
+    delivery = AutomationWebhookDelivery.objects.create(
+        webhook_id=webhook_id,
+        event=event,
+        payload=payload,
+        max_attempts=5,
+        next_attempt_at=timezone.now(),
+    )
+    create_job(
+        job_type="deliver_automation_webhook",
+        payload={"delivery_id": delivery.id},
+        priority=Job.PRIORITY_HIGH,
+        idempotency_key=f"automation_webhook:{delivery.id}",
+    )
     return delivery
 
 
@@ -279,7 +301,7 @@ def handle_runtime_revalidate(job: Job) -> dict:
 def handle_search_index(job: Job) -> dict:
     """Index or remove a document from Meilisearch."""
     from .models import MediaAsset, Page, Post, Product
-    from .search_services import search_service
+    from shared.search.service import search_index
 
     object_type = str(job.payload.get("object_type") or "").strip().lower()
     operation = str(job.payload.get("operation") or "upsert").strip().lower()
@@ -297,14 +319,14 @@ def handle_search_index(job: Job) -> dict:
         index_name = index_map.get(object_type)
         if not index_name:
             return {"error": f"Unsupported object_type: {object_type}"}
-        deleted = search_service.delete_document(index_name, f"{object_type}_{object_id}")
+        deleted = search_index.delete_document(index_name, f"{object_type}_{object_id}")
         return {"deleted": bool(deleted), "object_type": object_type, "object_id": object_id}
 
     if object_type == "page":
         page = Page.objects.select_related("site").filter(pk=object_id).first()
         if not page:
             return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
-        indexed = search_service.index_page(page)
+        indexed = search_index.index_page(page)
         return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
 
     if object_type == "post":
@@ -316,7 +338,7 @@ def handle_search_index(job: Job) -> dict:
         )
         if not post:
             return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
-        indexed = search_service.index_post(post)
+        indexed = search_index.index_post(post)
         return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
 
     if object_type == "product":
@@ -328,17 +350,223 @@ def handle_search_index(job: Job) -> dict:
         )
         if not product:
             return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
-        indexed = search_service.index_product(product)
+        indexed = search_index.index_product(product)
         return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
 
     if object_type == "media":
         media = MediaAsset.objects.select_related("site").filter(pk=object_id).first()
         if not media:
             return {"skipped": True, "reason": "missing", "object_type": object_type, "object_id": object_id}
-        indexed = search_service.index_media(media)
+        indexed = search_index.index_media(media)
         return {"indexed": bool(indexed), "object_type": object_type, "object_id": object_id}
 
     return {"error": f"Unsupported object_type: {object_type}"}
+
+
+@register_job("ai_generate")
+def handle_ai_generate(job: Job) -> dict:
+    """Run an AI generation job and persist usage/output metadata."""
+    from provider.models import AIJob
+    from shared.ai.service import process_ai_job
+
+    ai_job_id = int(job.payload.get("ai_job_id") or 0)
+    if ai_job_id <= 0:
+        return {"error": "Invalid ai_job_id"}
+    try:
+        ai_job = AIJob.objects.select_related("site").get(pk=ai_job_id)
+    except AIJob.DoesNotExist:
+        return {"error": f"AI job {ai_job_id} not found"}
+
+    processed = process_ai_job(ai_job)
+    return {
+        "ai_job_id": processed.id,
+        "status": processed.status,
+        "provider": processed.provider,
+        "model_name": processed.model_name,
+        "total_tokens": processed.total_tokens,
+    }
+
+
+@register_job("deliver_notification_email")
+def handle_deliver_notification_email(job: Job) -> dict:
+    """Deliver a queued email notification."""
+    from provider.services import providers
+    from notifications.models import Notification
+
+    notification_id = int(job.payload.get("notification_id") or 0)
+    if notification_id <= 0:
+        return {"error": "Invalid notification_id"}
+
+    try:
+        notification = Notification.objects.select_related("recipient").get(pk=notification_id)
+    except Notification.DoesNotExist:
+        return {"error": f"Notification {notification_id} not found"}
+
+    if notification.channel != Notification.CHANNEL_EMAIL:
+        return {"skipped": True, "reason": "notification.channel_mismatch"}
+    if notification.status in {Notification.STATUS_SENT, Notification.STATUS_READ}:
+        return {"skipped": True, "reason": "notification.already_delivered"}
+    recipient_email = ""
+    if notification.recipient_id and notification.recipient.email:
+        recipient_email = notification.recipient.email
+    else:
+        recipient_email = str((notification.payload or {}).get("recipient_email") or "").strip()
+    if not recipient_email:
+        notification.status = Notification.STATUS_FAILED
+        notification.error_message = "Recipient email unavailable."
+        notification.save(update_fields=["status", "error_message", "updated_at"])
+        return {"error": "Recipient email unavailable."}
+
+    try:
+        providers.email.send(
+            subject=notification.subject or "Notification",
+            body=notification.body or "",
+            to=[recipient_email],
+            html="",
+        )
+        notification.status = Notification.STATUS_SENT
+        notification.delivered_at = timezone.now()
+        notification.error_message = ""
+        notification.save(update_fields=["status", "delivered_at", "error_message", "updated_at"])
+        return {"notification_id": notification.id, "delivered": True}
+    except Exception as exc:
+        notification.status = Notification.STATUS_FAILED
+        notification.error_message = str(exc)[:2000]
+        notification.save(update_fields=["status", "error_message", "updated_at"])
+        return {"notification_id": notification.id, "delivered": False, "error": notification.error_message}
+
+
+@register_job("deliver_integration_webhook")
+def handle_deliver_integration_webhook(job: Job) -> dict:
+    """Deliver one integration webhook endpoint payload with retries."""
+    from urllib import error as urllib_error
+    from urllib import request as urllib_request
+
+    from notifications.models import WebhookEndpointDelivery
+    from shared.events.signing import sign_payload
+
+    delivery_id = int(job.payload.get("delivery_id") or 0)
+    if delivery_id <= 0:
+        return {"error": "Invalid delivery_id"}
+
+    lock_key = f"integration_webhook_delivery_lock:{delivery_id}"
+    if not cache.add(lock_key, True, timeout=120):
+        return {"skipped": True, "reason": "Delivery is already being processed"}
+
+    try:
+        delivery = WebhookEndpointDelivery.objects.select_related("endpoint").get(pk=delivery_id)
+    except WebhookEndpointDelivery.DoesNotExist:
+        cache.delete(lock_key)
+        return {"error": f"Delivery {delivery_id} not found"}
+
+    endpoint = delivery.endpoint
+    try:
+        if delivery.status == WebhookEndpointDelivery.STATUS_DELIVERED:
+            return {"skipped": True, "reason": "Already delivered"}
+
+        delivery.attempt_count += 1
+        delivery.last_attempt_at = timezone.now()
+
+        payload_bytes = json.dumps(delivery.payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "WebsiteBuilder-IntegrationWebhook/1.0",
+            "X-Webhook-Event": delivery.event,
+            "X-Webhook-Delivery": str(delivery.id),
+        }
+        if isinstance(endpoint.headers, dict):
+            for key, value in endpoint.headers.items():
+                key_text = str(key).strip()
+                if key_text:
+                    headers[key_text] = str(value)
+        if endpoint.signing_secret:
+            headers["X-Webhook-Signature"] = sign_payload(endpoint.signing_secret, payload_bytes)
+
+        req = urllib_request.Request(
+            endpoint.url,
+            data=payload_bytes,
+            headers=headers,
+            method="POST",
+        )
+        start_time = time.time()
+        status_code = 0
+        response_text = ""
+        try:
+            with urllib_request.urlopen(req, timeout=max(1, int(endpoint.timeout_seconds or 15))) as response:
+                status_code = int(response.status)
+                response_text = response.read().decode("utf-8", errors="replace")
+        except urllib_error.HTTPError as exc:
+            status_code = int(exc.code)
+            response_text = exc.read().decode("utf-8", errors="replace")
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        delivery.response_status = status_code
+        delivery.response_body = response_text[:5000]
+        delivery.response_time_ms = elapsed_ms
+
+        if 200 <= status_code < 300:
+            delivery.status = WebhookEndpointDelivery.STATUS_DELIVERED
+            delivery.error_message = ""
+        else:
+            raise RuntimeError(f"HTTP {status_code}: {response_text[:200]}")
+    except Exception as exc:
+        delivery.error_message = str(exc)[:2000]
+        if delivery.attempt_count < delivery.max_attempts:
+            delay_minutes = 5 ** (delivery.attempt_count - 1)
+            delivery.next_attempt_at = timezone.now() + timedelta(minutes=delay_minutes)
+            create_job(
+                job_type="deliver_integration_webhook",
+                payload={"delivery_id": delivery.id},
+                scheduled_at=delivery.next_attempt_at,
+                priority=Job.PRIORITY_NORMAL,
+                idempotency_key=f"integration_webhook_retry:{delivery.id}:{delivery.attempt_count}",
+            )
+        else:
+            delivery.status = WebhookEndpointDelivery.STATUS_FAILED
+    finally:
+        delivery.save()
+        cache.delete(lock_key)
+
+    return {
+        "delivery_id": delivery.id,
+        "status": delivery.status,
+        "attempt": delivery.attempt_count,
+        "status_code": delivery.response_status,
+    }
+
+
+@register_job("compliance_export_data")
+def handle_compliance_export_data(job: Job) -> dict:
+    """Build a data export payload for a requested user."""
+    from core.compliance import process_data_export_job
+    from core.models import DataExportJob
+
+    export_job_id = int(job.payload.get("export_job_id") or 0)
+    if export_job_id <= 0:
+        return {"error": "Invalid export_job_id"}
+    try:
+        export_job = DataExportJob.objects.get(pk=export_job_id)
+    except DataExportJob.DoesNotExist:
+        return {"error": f"DataExportJob {export_job_id} not found"}
+    processed = process_data_export_job(export_job)
+    return {"export_job_id": processed.id, "status": processed.status}
+
+
+@register_job("compliance_delete_data")
+def handle_compliance_delete_data(job: Job) -> dict:
+    """Execute approved account deletion/anonymization workflow."""
+    from core.compliance import process_data_deletion_job
+    from core.models import DataDeletionJob
+
+    deletion_job_id = int(job.payload.get("deletion_job_id") or 0)
+    if deletion_job_id <= 0:
+        return {"error": "Invalid deletion_job_id"}
+    try:
+        deletion_job = DataDeletionJob.objects.get(pk=deletion_job_id)
+    except DataDeletionJob.DoesNotExist:
+        return {"error": f"DataDeletionJob {deletion_job_id} not found"}
+    processed = process_data_deletion_job(deletion_job)
+    return {"deletion_job_id": processed.id, "status": processed.status}
 
 
 @register_job("deliver_webhook")
@@ -452,6 +680,107 @@ def handle_deliver_webhook(job: Job) -> dict:
     }
 
 
+@register_job("deliver_automation_webhook")
+def handle_deliver_automation_webhook(job: Job) -> dict:
+    """Deliver an automation webhook with retry support."""
+    from urllib import error as urllib_error
+    from urllib import request as urllib_request
+
+    delivery_id = job.payload.get("delivery_id")
+    if not delivery_id:
+        return {"error": "No delivery_id in payload"}
+
+    lock_key = f"automation_webhook_delivery_lock:{delivery_id}"
+    if not cache.add(lock_key, True, timeout=120):
+        return {"skipped": True, "reason": "Delivery is already being processed"}
+
+    try:
+        delivery = AutomationWebhookDelivery.objects.select_related("webhook").get(pk=delivery_id)
+    except AutomationWebhookDelivery.DoesNotExist:
+        cache.delete(lock_key)
+        return {"error": f"Automation delivery {delivery_id} not found"}
+
+    webhook = delivery.webhook
+    try:
+        if delivery.status == AutomationWebhookDelivery.STATUS_DELIVERED:
+            return {"skipped": True, "reason": "Already delivered"}
+        delivery.attempt_count += 1
+        delivery.last_attempt_at = timezone.now()
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "WebsiteBuilder-Automation/1.0",
+            "X-Automation-Event": delivery.event,
+            "X-Automation-Delivery": str(delivery.id),
+        }
+        if isinstance(webhook.headers, dict):
+            for key, value in webhook.headers.items():
+                key_text = str(key).strip()
+                value_text = str(value)
+                if key_text:
+                    headers[key_text] = value_text
+        if webhook.secret:
+            import hmac
+
+            signature = hmac.new(
+                webhook.secret.encode(),
+                json.dumps(delivery.payload).encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-Automation-Signature"] = f"sha256={signature}"
+
+        start_time = time.time()
+        body = json.dumps(delivery.payload).encode("utf-8")
+        req = urllib_request.Request(
+            webhook.url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        status_code = 0
+        response_text = ""
+        try:
+            with urllib_request.urlopen(req, timeout=max(1, int(webhook.timeout_seconds or 15))) as response:
+                status_code = int(response.status)
+                response_text = response.read().decode("utf-8", errors="replace")
+        except urllib_error.HTTPError as exc:
+            status_code = int(exc.code)
+            response_text = exc.read().decode("utf-8", errors="replace")
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        delivery.response_status = status_code
+        delivery.response_body = response_text[:5000]
+        delivery.response_time_ms = elapsed_ms
+
+        if 200 <= status_code < 300:
+            delivery.status = AutomationWebhookDelivery.STATUS_DELIVERED
+        else:
+            raise RuntimeError(f"HTTP {status_code}: {response_text[:200]}")
+    except Exception as exc:
+        delivery.error_message = str(exc)
+        if delivery.attempt_count < delivery.max_attempts:
+            delay_minutes = 5 ** (delivery.attempt_count - 1)
+            delivery.next_attempt_at = timezone.now() + timedelta(minutes=delay_minutes)
+            create_job(
+                job_type="deliver_automation_webhook",
+                payload={"delivery_id": delivery.id},
+                scheduled_at=delivery.next_attempt_at,
+                priority=Job.PRIORITY_NORMAL,
+                idempotency_key=f"automation_webhook_retry:{delivery.id}:{delivery.attempt_count}",
+            )
+        else:
+            delivery.status = AutomationWebhookDelivery.STATUS_FAILED
+    finally:
+        delivery.save()
+        cache.delete(lock_key)
+
+    return {
+        "delivered": delivery.status == AutomationWebhookDelivery.STATUS_DELIVERED,
+        "attempt": delivery.attempt_count,
+        "status_code": delivery.response_status,
+    }
+
+
 @register_job("run_seo_audit")
 def handle_run_seo_audit(job: Job) -> dict:
     """Run SEO audit for a page."""
@@ -545,6 +874,39 @@ def process_job(job: Job, *, already_running: bool = False) -> None:
         job.result = result or {}
         job.status = Job.STATUS_COMPLETED
         job.completed_at = timezone.now()
+        if job.job_type == "publish_content":
+            content_type = str((job.result or {}).get("content_type") or job.payload.get("content_type") or "")
+            content_id = int((job.result or {}).get("content_id") or job.payload.get("content_id") or 0)
+            if content_type and content_id > 0:
+                site = None
+                if content_type == "page":
+                    from .models import Page
+
+                    site = Page.objects.filter(pk=content_id).select_related("site").values_list("site_id", flat=True).first()
+                elif content_type == "post":
+                    from .models import Post
+
+                    site = Post.objects.filter(pk=content_id).select_related("site").values_list("site_id", flat=True).first()
+                elif content_type == "product":
+                    from .models import Product
+
+                    site = Product.objects.filter(pk=content_id).select_related("site").values_list("site_id", flat=True).first()
+                if site:
+                    from .models import Site
+                    from notifications.services import trigger_webhooks
+
+                    site_obj = Site.objects.filter(pk=site).first()
+                    if site_obj:
+                        trigger_webhooks(
+                            site_obj,
+                            "publish.job.completed",
+                            {
+                                "job_id": job.job_id,
+                                "content_type": content_type,
+                                "content_id": content_id,
+                                "result": job.result,
+                            },
+                        )
 
     except Exception as e:
         job.last_error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
@@ -601,7 +963,7 @@ def process_scheduled_content() -> int:
 
     # Posts
     posts = Post.objects.filter(
-        status=Post.STATUS_DRAFT,
+        status__in=[Post.STATUS_DRAFT, Post.STATUS_SCHEDULED],
         scheduled_at__isnull=False,
         scheduled_at__lte=now,
     )

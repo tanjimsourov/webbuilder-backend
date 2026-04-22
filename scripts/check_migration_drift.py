@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 import sys
 
@@ -24,7 +25,7 @@ def main() -> int:
     env = os.environ.copy()
     # Keep the drift check runnable in local dev shells where .env is not loaded.
     env.setdefault("DJANGO_DEBUG", "true")
-    env.setdefault("DJANGO_SECRET_KEY", "local-dev-migration-drift-secret-key-123456")
+    env.setdefault("DJANGO_SECRET_KEY", secrets.token_urlsafe(48))
     env.setdefault("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 
     command = [

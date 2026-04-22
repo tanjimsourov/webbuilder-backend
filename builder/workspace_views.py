@@ -19,18 +19,30 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from shared.auth.audit import log_security_event
+from shared.policies.access import (
+    SitePermission,
+    WorkspacePermission,
+    has_site_permission,
+    has_workspace_permission,
+    resolve_site_role,
+    resolve_workspace_role,
+)
+
 from .models import (
     Site,
     Workspace,
     WorkspaceInvitation,
     WorkspaceMembership,
 )
+from core.models import SiteMembership
 from .serializers import (
     WorkspaceSerializer,
     WorkspaceMembershipSerializer,
     WorkspaceInvitationSerializer,
     InviteMemberSerializer,
     ChangeMemberRoleSerializer,
+    InvitationTokenSerializer,
 )
 
 User = get_user_model()
@@ -47,14 +59,16 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
     def _require_member_management(self, workspace: Workspace, *, owner_only: bool = False) -> None:
         if self.request.user.is_superuser:
             return
-        if workspace.owner_id == self.request.user.id:
-            return
-        membership = self._membership_for(workspace)
-        if not membership:
+        role = resolve_workspace_role(self.request.user, workspace)
+        if not role:
             raise PermissionDenied("You don't have permission to access this workspace.")
-        if owner_only and membership.role != WorkspaceMembership.ROLE_OWNER:
+        if owner_only and role != WorkspaceMembership.ROLE_OWNER:
             raise PermissionDenied("Only workspace owners can perform this action.")
-        if not owner_only and not membership.can_manage_members:
+        if not owner_only and not has_workspace_permission(
+            self.request.user,
+            workspace,
+            WorkspacePermission.MANAGE_MEMBERS,
+        ):
             raise PermissionDenied("You don't have permission to manage this workspace.")
 
     def get_queryset(self):
@@ -64,7 +78,13 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
         return (
             Workspace.objects.select_related("owner")
             .prefetch_related("memberships")
-            .filter(models.Q(owner=user) | models.Q(memberships__user=user))
+            .filter(
+                models.Q(owner=user)
+                | models.Q(
+                    memberships__user=user,
+                    memberships__status=WorkspaceMembership.STATUS_ACTIVE,
+                )
+            )
             .annotate(member_count=models.Count("memberships", distinct=True))
             .annotate(site_count=models.Count("sites", distinct=True))
             .distinct()
@@ -223,6 +243,18 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
 
         target_membership.role = new_role
         target_membership.save(update_fields=["role", "updated_at"])
+        log_security_event(
+            "workspace.role_change",
+            request=request,
+            actor=request.user,
+            target_type="workspace_membership",
+            target_id=str(target_membership.pk),
+            metadata={
+                "workspace_id": workspace.pk,
+                "user_id": target_membership.user_id,
+                "new_role": new_role,
+            },
+        )
 
         return Response(WorkspaceMembershipSerializer(target_membership, context={"request": request}).data)
 
@@ -298,17 +330,9 @@ class AcceptInvitationView(APIView):
         return [InvitationAcceptThrottle()]
 
     def post(self, request):
-        token = str(request.data.get("token") or "").strip()
-        if not token:
-            return Response(
-                {"detail": "Invitation token is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if len(token) < 16:
-            return Response(
-                {"detail": "Invitation token is invalid."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        serializer = InvitationTokenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token = serializer.validated_data["token"].strip()
 
         # User must be authenticated
         if not request.user.is_authenticated:
@@ -393,17 +417,9 @@ class DeclineInvitationView(APIView):
         return [InvitationAcceptThrottle()]
 
     def post(self, request):
-        token = str(request.data.get("token") or "").strip()
-        if not token:
-            return Response(
-                {"detail": "Invitation token is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if len(token) < 16:
-            return Response(
-                {"detail": "Invitation token is invalid."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        serializer = InvitationTokenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token = serializer.validated_data["token"].strip()
 
         with transaction.atomic():
             invitation = (
@@ -437,7 +453,13 @@ class MyWorkspacesView(APIView):
         workspaces = (
             Workspace.objects.select_related("owner")
             .prefetch_related("memberships")
-            .filter(models.Q(owner=request.user) | models.Q(memberships__user=request.user))
+            .filter(
+                models.Q(owner=request.user)
+                | models.Q(
+                    memberships__user=request.user,
+                    memberships__status=WorkspaceMembership.STATUS_ACTIVE,
+                )
+            )
             .annotate(member_count=models.Count("memberships", distinct=True))
             .annotate(site_count=models.Count("sites", distinct=True))
             .distinct()
@@ -454,35 +476,18 @@ class MyWorkspacesView(APIView):
 
 def get_user_workspace_role(user, site) -> str | None:
     """Get the user's role for a site's workspace."""
-    if not user.is_authenticated:
-        return None
-    if not site.workspace:
-        # Legacy site without workspace - allow if user is superuser
-        return WorkspaceMembership.ROLE_OWNER if user.is_superuser else None
-    if site.workspace.owner_id == user.id:
-        return WorkspaceMembership.ROLE_OWNER
-    membership = site.workspace.memberships.filter(user=user).first()
-    return membership.role if membership else None
+    resolved = resolve_site_role(user, site)
+    return resolved.workspace_role
 
 
 def check_site_permission(user, site, require_edit: bool = False) -> bool:
     """Check if user has permission to access/edit a site."""
-    if user.is_superuser:
-        return True
-    role = get_user_workspace_role(user, site)
-    if not role:
-        return False
-    if require_edit:
-        return role in (WorkspaceMembership.ROLE_OWNER, WorkspaceMembership.ROLE_ADMIN, WorkspaceMembership.ROLE_EDITOR)
-    return True
+    return has_site_permission(user, site, SitePermission.EDIT if require_edit else SitePermission.VIEW)
 
 
 def check_site_manage_permission(user, site) -> bool:
     """Check if user can perform owner/admin-only actions for a site."""
-    if user.is_superuser:
-        return True
-    role = get_user_workspace_role(user, site)
-    return role in (WorkspaceMembership.ROLE_OWNER, WorkspaceMembership.ROLE_ADMIN)
+    return has_site_permission(user, site, SitePermission.MANAGE)
 
 
 def get_or_create_personal_workspace(user) -> Workspace:
@@ -549,7 +554,9 @@ def filter_sites_by_permission(user, queryset):
         return queryset.none()
     # Legacy workspace-less sites remain visible to superusers only.
     return queryset.filter(
-        models.Q(workspace__memberships__user=user) | models.Q(workspace__owner=user)
+        models.Q(workspace__memberships__user=user, workspace__memberships__status=WorkspaceMembership.STATUS_ACTIVE)
+        | models.Q(workspace__owner=user)
+        | models.Q(memberships__user=user, memberships__status=SiteMembership.STATUS_ACTIVE)
     ).distinct()
 
 
@@ -560,5 +567,5 @@ def get_user_workspaces(user):
     if user.is_superuser:
         return Workspace.objects.all().order_by("name")
     return Workspace.objects.filter(
-        models.Q(owner=user) | models.Q(memberships__user=user)
+        models.Q(owner=user) | models.Q(memberships__user=user, memberships__status=WorkspaceMembership.STATUS_ACTIVE)
     ).distinct().order_by("name")

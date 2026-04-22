@@ -1,59 +1,59 @@
-# Git
+# VCS and CI metadata
 .git
+.github
 .gitignore
 
-# Python
-__pycache__
+# Python build/runtime artifacts
+__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-.venv
-venv
-ENV
-env
-.eggs
-*.egg-info
+.venv/
+venv/
+ENV/
+env/
+.eggs/
+*.egg-info/
 *.egg
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
 
-# IDE
-.idea
-.vscode
+# Local files and secrets
+.env
+.env.*
+!.env.example
+*.sqlite3
+db.sqlite3
+*.log
+
+# Runtime data
+media/
+staticfiles/
+var/
+output/
+
+# Dependency caches
+.deps/
+.pip-cache/
+.wheelhouse/
+pip-build-tracker-*
+pip-download-*
+pip-unpack-*
+
+# Node/editor junk
+node_modules/
+.idea/
+.vscode/
 *.swp
 *.swo
 
-# Testing
-.pytest_cache
-.coverage
-htmlcov
-.tox
-
-# Local development
-*.sqlite3
-db.sqlite3
-.env
-.env.local
-*.log
-
-# Media and static (built at runtime)
-media/
-staticfiles/
-
-# Temporary files
+# Temp
+.tmp/
+.test-*/
 *.tmp
 *.temp
-.tmp/
-.test-*
-
-# Dependencies cache
-.deps/
-.pip-cache/
-
-# Documentation
-*.md
-!README.md
-
-# Docker
-Dockerfile
-docker-compose*.yml
-.dockerignore

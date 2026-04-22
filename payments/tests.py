@@ -58,7 +58,7 @@ class PaymentsSecurityTests(TestCase):
         )
         self.assertEqual(response.status_code, 503)
 
-    @override_settings(STRIPE_SECRET_KEY="sk_test_configured")
+    @override_settings(STRIPE_SECRET_KEY="stripe-secret-key-test-configured")
     def test_checkout_session_for_one_time_plan_omits_recurring_price_data(self):
         request = self.request_factory.post("/api/payments/checkout/session/")
         request.user = self.user
@@ -76,7 +76,7 @@ class PaymentsSecurityTests(TestCase):
         self.assertNotIn("recurring", line_item)
 
     @skipIf(payment_views.stripe is None, "Stripe SDK is not installed")
-    @override_settings(STRIPE_WEBHOOK_SECRET="whsec_test", PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS=60)
+    @override_settings(STRIPE_WEBHOOK_SECRET="stripe-webhook-secret-test", PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_SECONDS=60)
     def test_stripe_webhook_deduplicates_event_ids(self):
         event = {
             "id": "evt_duplicate_1",
@@ -105,7 +105,7 @@ class PaymentsSecurityTests(TestCase):
         self.assertTrue(second.json().get("duplicate"))
 
     @skipIf(payment_views.stripe is None, "Stripe SDK is not installed")
-    @override_settings(STRIPE_WEBHOOK_SECRET="whsec_test")
+    @override_settings(STRIPE_WEBHOOK_SECRET="stripe-webhook-secret-test")
     def test_stripe_webhook_rejects_invalid_signature(self):
         signature_error = payment_views.stripe.error.SignatureVerificationError("invalid signature", "sig")
         with mock.patch("payments.views.stripe.Webhook.construct_event", side_effect=signature_error):

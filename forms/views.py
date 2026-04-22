@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from django.db.models import Q
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import permissions, status
@@ -26,7 +27,14 @@ from cms.services import public_site_capabilities, resolve_public_page
 from core.views import PublicRuntimeSiteMixin
 from forms.models import Form, FormSubmission
 from forms.serializers import PublicRuntimeFormSchemaSerializer, PublicRuntimeFormSubmitSerializer
-from forms.services import trigger_webhooks
+from forms.services import (
+    evaluate_form_spam,
+    export_form_submissions_csv,
+    queue_form_email_notifications,
+    trigger_webhooks,
+)
+from shared.policies.access import SitePermission, has_site_permission
+from shared.contracts.sanitize import sanitize_json_payload
 
 
 def _validate_runtime_form_payload(form: Form, payload: dict) -> dict[str, str]:
@@ -125,6 +133,21 @@ class PublicRuntimeFormSubmissionView(PublicRuntimeSiteMixin, APIView):
         if errors:
             return Response({"errors": errors}, status=status.HTTP_400_BAD_REQUEST)
 
+        spam_result = evaluate_form_spam(
+            form=form,
+            payload=payload,
+            user_agent=(request.META.get("HTTP_USER_AGENT") or "")[:500],
+            ip_address=(request.META.get("REMOTE_ADDR") or "")[:64],
+        )
+        if spam_result.is_spam:
+            return Response(
+                {
+                    "success": True,
+                    "message": form.success_message,
+                    "redirect_url": form.redirect_url or None,
+                }
+            )
+
         page = None
         page_path = serializer.validated_data.get("page_path") or ""
         locale_code = serializer.validated_data.get("locale") or ""
@@ -142,7 +165,7 @@ class PublicRuntimeFormSubmissionView(PublicRuntimeSiteMixin, APIView):
             site=site,
             page=page,
             form_name=form.slug,
-            payload=payload,
+            payload=sanitize_json_payload(payload),
             status=FormSubmission.STATUS_NEW,
         )
         trigger_webhooks(
@@ -155,6 +178,7 @@ class PublicRuntimeFormSubmissionView(PublicRuntimeSiteMixin, APIView):
                 "payload": payload,
             },
         )
+        queue_form_email_notifications(form=form, submission=submission)
         return Response(
             {
                 "success": True,
@@ -166,8 +190,23 @@ class PublicRuntimeFormSubmissionView(PublicRuntimeSiteMixin, APIView):
         )
 
 
+class FormSubmissionExportView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, form_id: int):
+        form = get_object_or_404(Form.objects.select_related("site", "site__workspace"), pk=form_id)
+        if not has_site_permission(request.user, form.site, SitePermission.VIEW):
+            return Response({"detail": "You don't have permission to export submissions."}, status=status.HTTP_403_FORBIDDEN)
+        csv_data = export_form_submissions_csv(form=form)
+        filename = f"form-{form.slug}-submissions.csv"
+        response = HttpResponse(csv_data, content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
 __all__ = [
     "FormSubmissionViewSet",
+    "FormSubmissionExportView",
     "FormViewSet",
     "PublicFormSubmissionView",
     "PublicFormView",

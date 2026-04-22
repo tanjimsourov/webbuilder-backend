@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from django.db import models
 
 from cms.models import Page
@@ -174,3 +176,203 @@ class SEOSettings(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.site.name}: SEO settings"
+
+
+class AnalyticsSession(TimeStampedModel):
+    DEVICE_DESKTOP = "desktop"
+    DEVICE_MOBILE = "mobile"
+    DEVICE_TABLET = "tablet"
+    DEVICE_BOT = "bot"
+    DEVICE_UNKNOWN = "unknown"
+    DEVICE_CHOICES = [
+        (DEVICE_DESKTOP, "Desktop"),
+        (DEVICE_MOBILE, "Mobile"),
+        (DEVICE_TABLET, "Tablet"),
+        (DEVICE_BOT, "Bot"),
+        (DEVICE_UNKNOWN, "Unknown"),
+    ]
+
+    site = models.ForeignKey(Site, related_name="analytics_sessions", on_delete=models.CASCADE)
+    session_key = models.CharField(max_length=64, default=uuid.uuid4, db_index=True)
+    started_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField()
+    ended_at = models.DateTimeField(null=True, blank=True)
+    landing_path = models.CharField(max_length=255, blank=True)
+    exit_path = models.CharField(max_length=255, blank=True)
+    referrer = models.CharField(max_length=500, blank=True)
+    referrer_domain = models.CharField(max_length=255, blank=True)
+    utm_source = models.CharField(max_length=120, blank=True)
+    utm_medium = models.CharField(max_length=120, blank=True)
+    utm_campaign = models.CharField(max_length=120, blank=True)
+    device_type = models.CharField(max_length=20, choices=DEVICE_CHOICES, default=DEVICE_UNKNOWN)
+    browser = models.CharField(max_length=120, blank=True)
+    os = models.CharField(max_length=120, blank=True)
+    ip_hash = models.CharField(max_length=64, blank=True)
+    ip_prefix = models.CharField(max_length=64, blank=True)
+    user_agent_hash = models.CharField(max_length=64, blank=True)
+    is_bot = models.BooleanField(default=False)
+    page_view_count = models.PositiveIntegerField(default=0)
+    event_count = models.PositiveIntegerField(default=0)
+    conversion_count = models.PositiveIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "analytics_sessions"
+        ordering = ["-last_seen_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["site", "session_key"], name="analytics_unique_site_session_key"),
+        ]
+        indexes = [
+            models.Index(fields=["site", "last_seen_at"]),
+            models.Index(fields=["site", "is_bot", "last_seen_at"]),
+            models.Index(fields=["site", "started_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.site.name}: session {self.session_key}"
+
+
+class AnalyticsEvent(TimeStampedModel):
+    TYPE_PAGE_VIEW = "page_view"
+    TYPE_EVENT = "event"
+    TYPE_CONVERSION = "conversion"
+    TYPE_FUNNEL = "funnel"
+    TYPE_CHOICES = [
+        (TYPE_PAGE_VIEW, "Page view"),
+        (TYPE_EVENT, "Event"),
+        (TYPE_CONVERSION, "Conversion"),
+        (TYPE_FUNNEL, "Funnel"),
+    ]
+
+    site = models.ForeignKey(Site, related_name="analytics_events", on_delete=models.CASCADE)
+    session = models.ForeignKey(
+        AnalyticsSession,
+        related_name="events",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    event_name = models.CharField(max_length=120, default="page_view")
+    event_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_EVENT)
+    path = models.CharField(max_length=255, blank=True)
+    title = models.CharField(max_length=255, blank=True)
+    referrer = models.CharField(max_length=500, blank=True)
+    referrer_domain = models.CharField(max_length=255, blank=True)
+    device_type = models.CharField(max_length=20, choices=AnalyticsSession.DEVICE_CHOICES, default=AnalyticsSession.DEVICE_UNKNOWN)
+    browser = models.CharField(max_length=120, blank=True)
+    os = models.CharField(max_length=120, blank=True)
+    value = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    is_bot = models.BooleanField(default=False)
+    ip_hash = models.CharField(max_length=64, blank=True)
+    ip_prefix = models.CharField(max_length=64, blank=True)
+    user_agent_hash = models.CharField(max_length=64, blank=True)
+    properties = models.JSONField(default=dict, blank=True)
+    occurred_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "analytics_events"
+        ordering = ["-occurred_at"]
+        indexes = [
+            models.Index(fields=["site", "event_type", "occurred_at"]),
+            models.Index(fields=["site", "event_name", "occurred_at"]),
+            models.Index(fields=["site", "path", "occurred_at"]),
+            models.Index(fields=["session", "occurred_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.site.name}: {self.event_name} ({self.event_type})"
+
+
+class SearchDocument(TimeStampedModel):
+    site = models.ForeignKey(Site, related_name="search_documents", on_delete=models.CASCADE)
+    index_name = models.CharField(max_length=60)
+    external_id = models.CharField(max_length=120)
+    title = models.CharField(max_length=255, blank=True)
+    path = models.CharField(max_length=255, blank=True)
+    content = models.TextField(blank=True)
+    summary = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    source_updated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "search_documents"
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "index_name", "external_id"],
+                name="analytics_unique_search_document",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["site", "index_name", "updated_at"]),
+            models.Index(fields=["site", "path"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.site.name}: {self.index_name}/{self.external_id}"
+
+
+class AnalyticsRollup(TimeStampedModel):
+    PERIOD_DAILY = "daily"
+    PERIOD_CHOICES = [
+        (PERIOD_DAILY, "Daily"),
+    ]
+
+    site = models.ForeignKey(Site, related_name="analytics_rollups", on_delete=models.CASCADE)
+    period = models.CharField(max_length=20, choices=PERIOD_CHOICES, default=PERIOD_DAILY)
+    period_date = models.DateField()
+    page_views = models.PositiveIntegerField(default=0)
+    events = models.PositiveIntegerField(default=0)
+    conversions = models.PositiveIntegerField(default=0)
+    sessions = models.PositiveIntegerField(default=0)
+    total_value = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "analytics_rollups"
+        ordering = ["-period_date", "site_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "period", "period_date"],
+                name="analytics_unique_rollup_period",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["site", "period", "period_date"]),
+            models.Index(fields=["period", "period_date"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.site.name}: {self.period} {self.period_date}"
+
+
+class CommerceAnalyticsEvent(TimeStampedModel):
+    EVENT_PRODUCT_VIEW = "product.view"
+    EVENT_ADD_TO_CART = "cart.add"
+    EVENT_BEGIN_CHECKOUT = "checkout.begin"
+    EVENT_PURCHASE = "order.purchase"
+    EVENT_REFUND = "order.refund"
+    EVENT_CHOICES = [
+        (EVENT_PRODUCT_VIEW, "Product view"),
+        (EVENT_ADD_TO_CART, "Add to cart"),
+        (EVENT_BEGIN_CHECKOUT, "Begin checkout"),
+        (EVENT_PURCHASE, "Purchase"),
+        (EVENT_REFUND, "Refund"),
+    ]
+
+    site = models.ForeignKey(Site, related_name="commerce_analytics_events", on_delete=models.CASCADE)
+    event_name = models.CharField(max_length=60, choices=EVENT_CHOICES)
+    aggregate_type = models.CharField(max_length=60, blank=True)
+    aggregate_id = models.CharField(max_length=120, blank=True)
+    request_id = models.CharField(max_length=128, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["site", "event_name", "created_at"]),
+            models.Index(fields=["site", "aggregate_type", "aggregate_id"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.site.name}: {self.event_name}"

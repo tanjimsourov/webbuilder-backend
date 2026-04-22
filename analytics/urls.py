@@ -6,6 +6,12 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from analytics.views import (
+    AnalyticsEventViewSet,
+    AnalyticsFunnelView,
+    AnalyticsIngestView,
+    AnalyticsSessionViewSet,
+    AnalyticsSummaryView,
+    CommerceAnalyticsEventViewSet,
     GSCCallbackView,
     GSCConnectView,
     GSCCredentialUpdateView,
@@ -20,6 +26,7 @@ from analytics.views import (
     SEOAnalyticsViewSet,
     SEOAuditViewSet,
     SEOSettingsViewSet,
+    SearchDocumentViewSet,
     SerpBearStatusView,
     TrackedKeywordViewSet,
     UmamiStatusView,
@@ -31,8 +38,15 @@ router.register("seo-audits", SEOAuditViewSet, basename="seo-audit")
 router.register("seo-settings", SEOSettingsViewSet, basename="seo-settings")
 router.register("tracked-keywords", TrackedKeywordViewSet, basename="tracked-keyword")
 router.register("keyword-ranks", KeywordRankEntryViewSet, basename="keyword-rank")
+router.register("commerce-events", CommerceAnalyticsEventViewSet, basename="commerce-event")
+router.register("sessions", AnalyticsSessionViewSet, basename="analytics-session")
+router.register("events", AnalyticsEventViewSet, basename="analytics-event")
+router.register("search-documents", SearchDocumentViewSet, basename="search-document")
 
 urlpatterns = [
+    path("analytics/ingest/<slug:site_slug>/", AnalyticsIngestView.as_view(), name="analytics-ingest"),
+    path("analytics/sites/<int:site_id>/summary/", AnalyticsSummaryView.as_view(), name="analytics-summary"),
+    path("analytics/sites/<int:site_id>/funnel/", AnalyticsFunnelView.as_view(), name="analytics-funnel"),
     path("seo/librecrawl/status/", LibreCrawlStatusView.as_view(), name="librecrawl-status"),
     path("seo/serpbear/status/", SerpBearStatusView.as_view(), name="serpbear-status"),
     path("analytics/umami/status/", UmamiStatusView.as_view(), name="umami-status"),

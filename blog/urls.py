@@ -6,6 +6,7 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from blog.views import (
+    BlogAuthorViewSet,
     CommentViewSet,
     PostCategoryViewSet,
     PostTagViewSet,
@@ -18,6 +19,7 @@ from blog.views import (
 router = SimpleRouter()
 router.register("post-categories", PostCategoryViewSet, basename="post-category")
 router.register("post-tags", PostTagViewSet, basename="post-tag")
+router.register("authors", BlogAuthorViewSet, basename="blog-author")
 router.register("posts", PostViewSet, basename="post")
 router.register("comments", CommentViewSet, basename="comment")
 

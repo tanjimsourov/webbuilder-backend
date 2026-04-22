@@ -10,6 +10,14 @@ def main() -> None:
     if deps_dir.exists():
         sys.path.insert(0, str(deps_dir))
 
+    try:
+        from shared.config.dotenv import load_dotenv
+
+        load_dotenv(current_dir / ".env")
+    except Exception:
+        # Environment loading must never prevent management commands from running.
+        pass
+
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
     from django.core.management import execute_from_command_line
@@ -19,4 +27,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

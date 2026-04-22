@@ -7,6 +7,66 @@
 3. Use SQLite defaults from `.env.example` unless you explicitly want PostgreSQL.
 4. Run the backend with `pipenv run python manage.py runserver 127.0.0.1:8000 --noreload`.
 
+## Generic env aliases
+
+This repo's canonical configuration is `DJANGO_*` (validated in `config/settings.py`). For production deployments that prefer generic conventions, the following variables are supported as **aliases** and mapped into `DJANGO_*` at startup when the canonical variable is not already set:
+
+- `APP_ENV` → influences `DJANGO_DEBUG` (production disables debug)
+- `DATABASE_URL` → maps to `DJANGO_DB_*` when `DJANGO_DB_ENGINE` is not set
+- `REDIS_URL` → maps to `DJANGO_CACHE_URL` / `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` when missing
+- `SESSION_SECRET` → maps to `DJANGO_SECRET_KEY` when missing
+- `CORS_ALLOWED_ORIGINS` → maps to `DJANGO_CORS_ALLOWED_ORIGINS` when missing
+- `SMTP_*` → maps to `DJANGO_EMAIL_*` when missing
+- `STORAGE_DRIVER` / `STORAGE_BUCKET` → maps to `DJANGO_USE_S3_STORAGE` / `AWS_STORAGE_BUCKET_NAME` when missing
+
+## Security-specific variables
+
+- `DJANGO_AUTH_MAX_FAILED_LOGIN_ATTEMPTS`
+- `DJANGO_AUTH_LOCKOUT_SECONDS`
+- `DJANGO_AUTH_BACKOFF_MAX_SECONDS`
+- `DJANGO_AUTH_ACCESS_TOKEN_TTL_SECONDS`
+- `DJANGO_AUTH_REFRESH_TOKEN_TTL_SECONDS`
+- `DJANGO_AUTH_MFA_CHALLENGE_TTL_SECONDS`
+- `DJANGO_AUTH_EMAIL_VERIFICATION_TOKEN_TTL_SECONDS`
+- `DJANGO_AUTH_PASSWORD_RESET_TOKEN_TTL_SECONDS`
+- `DJANGO_PERMISSIONS_POLICY`
+- `DJANGO_CONTENT_SECURITY_POLICY`
+- `DJANGO_MAX_REQUEST_BODY_BYTES`
+- `MALWARE_SCAN_COMMAND`
+
+## AI / Analytics / Search variables
+
+- `AI_DEFAULT_PROVIDER` (`mock`, `openai`, `anthropic`)
+- `OPENAI_API_KEY`, `OPENAI_MODEL`
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
+- `AI_DEFAULT_MAX_REQUESTS`
+- `AI_DEFAULT_MAX_TOKENS`
+- `AI_DEFAULT_MAX_COST_USD`
+- `ANALYTICS_HASH_SALT`
+- `MEILISEARCH_HOST`, `MEILISEARCH_API_KEY`
+
+## Observability variables
+
+- `ERROR_TRACKING_PROVIDER` (`sentry` or `none`)
+- `TRACING_PROVIDER` (`opentelemetry` or `none`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT`
+- `OTEL_SERVICE_NAME`
+- `SENTRY_DSN`, `SENTRY_ENVIRONMENT`
+- `SENTRY_TRACES_SAMPLE_RATE`, `SENTRY_PROFILES_SAMPLE_RATE`
+
+## Startup and scheduler variables
+
+- `DJANGO_WAIT_FOR_DB`
+- `DJANGO_WAIT_FOR_CACHE`
+- `DJANGO_STARTUP_MAX_WAIT_SECONDS`
+- `SCHEDULER_PUBLISH_INTERVAL_SECONDS`
+- `SCHEDULER_AI_CLEANUP_INTERVAL_SECONDS`
+- `SCHEDULER_AI_RETENTION_DAYS`
+- `SCHEDULER_TOKEN_CLEANUP_INTERVAL_SECONDS`
+- `SCHEDULER_TOKEN_RETENTION_DAYS`
+- `SCHEDULER_ANALYTICS_ROLLUP_INTERVAL_SECONDS`
+- `SCHEDULER_ANALYTICS_ROLLUP_DAYS_BACK`
+
 ## Production Fail-Fast Rules
 
 When `DJANGO_DEBUG=false`, startup now fails immediately unless all critical configuration is valid.
@@ -58,3 +118,10 @@ When `DJANGO_DEBUG=false`, startup now fails immediately unless all critical con
 - Do not commit `.env`.
 - Keep only `.env.example` in the repository.
 - Rotate any previously exposed credentials before deploying.
+
+## Health/readiness endpoints
+
+- `GET /api/health/` database connectivity healthcheck.
+- `GET /api/live/` liveness probe.
+- `GET /api/ready/` readiness probe (database + cache).
+- `GET /api/version/` build/runtime metadata.

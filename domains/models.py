@@ -87,7 +87,11 @@ class Domain(TimeStampedModel):
     STATUS_PENDING = "pending"
     STATUS_VERIFIED = "verified"
     STATUS_FAILED = "failed"
+    STATUS_REQUESTED = "requested"
+    STATUS_VERIFYING = "verifying"
     STATUS_CHOICES = [
+        (STATUS_REQUESTED, "Requested"),
+        (STATUS_VERIFYING, "Verifying"),
         (STATUS_PENDING, "Pending Verification"),
         (STATUS_VERIFIED, "Verified"),
         (STATUS_FAILED, "Verification Failed"),
@@ -123,6 +127,7 @@ class Domain(TimeStampedModel):
     verification_method = models.CharField(
         max_length=40, choices=VERIFY_METHOD_CHOICES, default=VERIFY_METHOD_DNS_TXT, blank=True
     )
+    verification_state = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_REQUESTED)
     verified_at = models.DateTimeField(blank=True, null=True)
     last_verification_attempt = models.DateTimeField(blank=True, null=True)
     verification_error = models.TextField(blank=True)
@@ -138,6 +143,18 @@ class Domain(TimeStampedModel):
     transfer_lock = models.BooleanField(default=True)
     auth_code = models.CharField(max_length=255, blank=True)
     ssl_enabled = models.BooleanField(default=False)
+    ssl_status = models.CharField(
+        max_length=30,
+        choices=[
+            ("disabled", "Disabled"),
+            ("pending", "Pending"),
+            ("provisioning", "Provisioning"),
+            ("active", "Active"),
+            ("renewal_failed", "Renewal failed"),
+            ("revoked", "Revoked"),
+        ],
+        default="disabled",
+    )
     ssl_expires_at = models.DateTimeField(blank=True, null=True)
     dns_records = models.JSONField(default=list, blank=True)
     nameservers = models.JSONField(default=list, blank=True)
@@ -158,6 +175,41 @@ class Domain(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.site.name}: {self.domain_name}"
+
+
+class SSLCertificateProvisioning(TimeStampedModel):
+    STATUS_PENDING = "pending"
+    STATUS_PROVISIONING = "provisioning"
+    STATUS_ACTIVE = "active"
+    STATUS_RENEWAL_FAILED = "renewal_failed"
+    STATUS_REVOKED = "revoked"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_PROVISIONING, "Provisioning"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_RENEWAL_FAILED, "Renewal failed"),
+        (STATUS_REVOKED, "Revoked"),
+    ]
+
+    domain = models.ForeignKey(Domain, related_name="ssl_provisionings", on_delete=models.CASCADE)
+    provider = models.CharField(max_length=80, default="internal")
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    provider_reference = models.CharField(max_length=255, blank=True)
+    certificate_chain = models.TextField(blank=True)
+    private_key_reference = models.CharField(max_length=255, blank=True)
+    issued_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["domain", "status", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.domain.domain_name}:{self.status}"
 
 
 class DomainAvailability(models.Model):

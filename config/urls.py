@@ -29,6 +29,8 @@ urlpatterns = [
     path("api/", include("domains.urls")),
     path("api/", include("analytics.urls")),
     path("api/", include("notifications.urls")),
+    path("api/", include("website.urls")),
+    path("api/", include("provider.urls")),
     path("api/payments/", include(("payments.urls", "payments"), namespace="payments")),
     path("api/email-hosting/", include(("email_hosting.urls", "email_hosting"), namespace="email_hosting")),
     path("api/", include("builder.urls")),

@@ -25,6 +25,7 @@ from typing import Tuple
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from shared.storage.malware import scan_content
 
 
 # Dangerous SVG elements and attributes that can execute JavaScript
@@ -383,6 +384,12 @@ def validate_upload(file, filename: str = None, sanitize_svg_content: bool = Tru
     valid, error = validate_mime_type(file, fname)
     if not valid:
         return False, error, ""
+
+    # Optional malware scanning hook.
+    head_for_scan = _peek_file_bytes(file, max_bytes=getattr(settings, "MALWARE_SCAN_MAX_BYTES", 2 * 1024 * 1024))
+    clean, scan_error = scan_content(head_for_scan)
+    if not clean:
+        return False, f"Upload blocked by security scanner: {scan_error}", ""
     
     ext = get_file_extension(fname)
     kind = get_file_kind(ext)

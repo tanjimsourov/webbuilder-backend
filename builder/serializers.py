@@ -3,11 +3,14 @@ import ipaddress
 from urllib.parse import urlparse
 
 from django.conf import settings
+from django.contrib.auth import password_validation
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils.text import slugify
 from rest_framework import serializers
+from shared.contracts.sanitize import sanitize_json_payload, sanitize_rich_html, sanitize_text
+from shared.contracts.validation import unique_slug
 
 from cms.page_schema import (
     PAGE_SCHEMA_VERSION,
@@ -15,8 +18,11 @@ from cms.page_schema import (
     normalize_block_template_renderer_key,
     normalize_page_content,
 )
+from core.models import SecurityAuditLog, SiteMembership
 
 from .models import (
+    AssetUsageReference,
+    BlogAuthor,
     BlockTemplate,
     Cart,
     CartItem,
@@ -47,9 +53,12 @@ from .models import (
     Post,
     PostCategory,
     PostTag,
+    PreviewToken,
+    PublishSnapshot,
     Product,
     ProductCategory,
     ProductVariant,
+    ReusableSection,
     ShippingRate,
     ShippingZone,
     KeywordRankEntry,
@@ -59,6 +68,8 @@ from .models import (
     SEOSettings,
     Site,
     SiteLocale,
+    SiteShell,
+    ThemeTemplate,
     TaxRate,
     TrackedKeyword,
     URLRedirect,
@@ -861,36 +872,71 @@ class SiteMirrorImportSerializer(serializers.Serializer):
 
 class MediaAssetSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
+    is_deleted = serializers.SerializerMethodField()
 
     class Meta:
         model = MediaAsset
         fields = [
             "id",
             "site",
+            "folder",
             "title",
             "file",
             "file_url",
             "alt_text",
             "caption",
             "kind",
+            "tags",
+            "mime_type",
+            "file_size",
+            "content_signature",
+            "deleted_at",
+            "deleted_by",
+            "is_deleted",
             "metadata",
             "created_at",
             "updated_at",
         ]
+        read_only_fields = [
+            "mime_type",
+            "file_size",
+            "content_signature",
+            "deleted_at",
+            "deleted_by",
+            "is_deleted",
+        ]
 
     def get_file_url(self, obj: MediaAsset) -> str:
         if not obj.file:
+            return ""
+        if ".." in (obj.file.name or ""):
             return ""
         request = self.context.get("request")
         if request:
             return request.build_absolute_uri(obj.file.url)
         return obj.file.url
 
+    def get_is_deleted(self, obj: MediaAsset) -> bool:
+        return obj.deleted_at is not None
+
     def validate(self, attrs):
         title = attrs.get("title") or getattr(self.instance, "title", "")
         uploaded_file = attrs.get("file") or getattr(self.instance, "file", None)
         if not title and uploaded_file:
             attrs["title"] = uploaded_file.name.rsplit("/", 1)[-1]
+        if "alt_text" in attrs:
+            attrs["alt_text"] = sanitize_text(attrs.get("alt_text", ""), max_length=255)
+        if "caption" in attrs:
+            attrs["caption"] = sanitize_text(attrs.get("caption", ""), max_length=1000)
+        if "tags" in attrs:
+            normalized_tags: list[str] = []
+            for raw in attrs.get("tags") or []:
+                cleaned = sanitize_text(str(raw), max_length=60)
+                if cleaned:
+                    normalized_tags.append(cleaned.lower())
+            attrs["tags"] = sorted(set(normalized_tags))
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
         return attrs
 
 
@@ -902,12 +948,15 @@ class PostCategorySerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         site = attrs.get("site") or getattr(self.instance, "site", None)
         name = attrs.get("name") or getattr(self.instance, "name", "category")
-        attrs["slug"] = slugify(attrs.get("slug") or name) or "category"
-        query = PostCategory.objects.filter(site=site, slug=attrs["slug"])
+        query = PostCategory.objects.filter(site=site)
         if self.instance:
             query = query.exclude(pk=self.instance.pk)
-        if query.exists():
-            raise serializers.ValidationError({"slug": "Another category already uses this slug."})
+        attrs["slug"] = unique_slug(
+            value=attrs.get("slug") or name,
+            queryset=query,
+            fallback="category",
+            max_length=140,
+        )
         return attrs
 
 
@@ -919,12 +968,54 @@ class PostTagSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         site = attrs.get("site") or getattr(self.instance, "site", None)
         name = attrs.get("name") or getattr(self.instance, "name", "tag")
-        attrs["slug"] = slugify(attrs.get("slug") or name) or "tag"
-        query = PostTag.objects.filter(site=site, slug=attrs["slug"])
+        query = PostTag.objects.filter(site=site)
         if self.instance:
             query = query.exclude(pk=self.instance.pk)
-        if query.exists():
-            raise serializers.ValidationError({"slug": "Another tag already uses this slug."})
+        attrs["slug"] = unique_slug(
+            value=attrs.get("slug") or name,
+            queryset=query,
+            fallback="tag",
+            max_length=140,
+        )
+        return attrs
+
+
+class BlogAuthorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BlogAuthor
+        fields = [
+            "id",
+            "site",
+            "user",
+            "display_name",
+            "slug",
+            "bio",
+            "avatar_url",
+            "is_active",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        site = attrs.get("site") or getattr(self.instance, "site", None)
+        display_name = attrs.get("display_name") or getattr(self.instance, "display_name", "author")
+        query = BlogAuthor.objects.filter(site=site)
+        if self.instance:
+            query = query.exclude(pk=self.instance.pk)
+        attrs["slug"] = unique_slug(
+            value=attrs.get("slug") or display_name,
+            queryset=query,
+            fallback="author",
+            max_length=180,
+        )
+
+        if "bio" in attrs:
+            attrs["bio"] = sanitize_text(attrs.get("bio", ""), max_length=4000)
+        if "display_name" in attrs:
+            attrs["display_name"] = sanitize_text(attrs.get("display_name", ""), max_length=160)
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
         return attrs
 
 
@@ -1225,14 +1316,38 @@ class CommentSerializer(serializers.ModelSerializer):
             "author_email",
             "body",
             "is_approved",
+            "moderation_state",
+            "moderation_notes",
+            "spam_score",
+            "spam_provider",
+            "flagged_at",
+            "metadata",
             "created_at",
             "updated_at",
         ]
 
+    def validate(self, attrs):
+        if "author_name" in attrs:
+            attrs["author_name"] = sanitize_text(attrs.get("author_name", ""), max_length=140)
+        if "body" in attrs:
+            attrs["body"] = sanitize_text(attrs.get("body", ""), max_length=4000)
+        if "moderation_notes" in attrs:
+            attrs["moderation_notes"] = sanitize_text(attrs.get("moderation_notes", ""), max_length=1000)
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
+        moderation_state = attrs.get("moderation_state", getattr(self.instance, "moderation_state", Comment.MODERATION_PENDING))
+        if moderation_state == Comment.MODERATION_APPROVED:
+            attrs["is_approved"] = True
+        elif moderation_state in {Comment.MODERATION_REJECTED, Comment.MODERATION_SPAM}:
+            attrs["is_approved"] = False
+        return attrs
+
 
 class PostSerializer(serializers.ModelSerializer):
+    primary_author_detail = BlogAuthorSerializer(source="primary_author", read_only=True)
     categories = PostCategorySerializer(many=True, read_only=True)
     tags = PostTagSerializer(many=True, read_only=True)
+    related_posts = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
     category_ids = serializers.PrimaryKeyRelatedField(
         many=True,
         queryset=PostCategory.objects.all(),
@@ -1244,6 +1359,13 @@ class PostSerializer(serializers.ModelSerializer):
         many=True,
         queryset=PostTag.objects.all(),
         source="tags",
+        required=False,
+        write_only=True,
+    )
+    related_post_ids = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=Post.objects.all(),
+        source="related_posts",
         required=False,
         write_only=True,
     )
@@ -1263,13 +1385,19 @@ class PostSerializer(serializers.ModelSerializer):
             "status",
             "featured_media",
             "featured_media_url",
+            "primary_author",
+            "primary_author_detail",
+            "author_byline",
             "categories",
             "tags",
+            "related_posts",
             "category_ids",
             "tag_ids",
+            "related_post_ids",
             "seo",
             "published_at",
             "scheduled_at",
+            "moderation_notes",
             "preview_url",
             "comments",
             "created_at",
@@ -1290,24 +1418,47 @@ class PostSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         site = attrs.get("site") or getattr(self.instance, "site", None)
         title = attrs.get("title") or getattr(self.instance, "title", "post")
-        attrs["slug"] = slugify(attrs.get("slug") or title) or "post"
-
-        query = Post.objects.filter(site=site, slug=attrs["slug"])
+        query = Post.objects.filter(site=site)
         if self.instance:
             query = query.exclude(pk=self.instance.pk)
-        if query.exists():
-            raise serializers.ValidationError({"slug": "Another post already uses this slug."})
+        attrs["slug"] = unique_slug(
+            value=attrs.get("slug") or title,
+            queryset=query,
+            fallback="post",
+            max_length=180,
+        )
 
         featured_media = attrs.get("featured_media") or getattr(self.instance, "featured_media", None)
-        if featured_media and featured_media.site_id != site.id:
+        if site and featured_media and featured_media.site_id != site.id:
             raise serializers.ValidationError({"featured_media": "Featured media must belong to the same site."})
 
         for category in attrs.get("categories", []):
-            if category.site_id != site.id:
+            if site and category.site_id != site.id:
                 raise serializers.ValidationError({"category_ids": "Categories must belong to the same site."})
         for tag in attrs.get("tags", []):
-            if tag.site_id != site.id:
+            if site and tag.site_id != site.id:
                 raise serializers.ValidationError({"tag_ids": "Tags must belong to the same site."})
+        for related_post in attrs.get("related_posts", []):
+            if self.instance and related_post.pk == self.instance.pk:
+                raise serializers.ValidationError({"related_post_ids": "A post cannot be related to itself."})
+            if site and related_post.site_id != site.id:
+                raise serializers.ValidationError({"related_post_ids": "Related posts must belong to the same site."})
+
+        primary_author = attrs.get("primary_author") if "primary_author" in attrs else getattr(self.instance, "primary_author", None)
+        if primary_author and site and primary_author.site_id != site.id:
+            raise serializers.ValidationError({"primary_author": "Author must belong to the same site."})
+        if "excerpt" in attrs:
+            attrs["excerpt"] = sanitize_text(attrs.get("excerpt", ""), max_length=2000)
+        if "body_html" in attrs:
+            attrs["body_html"] = sanitize_rich_html(attrs.get("body_html", ""), max_length=150000)
+        if "author_byline" in attrs:
+            attrs["author_byline"] = sanitize_text(attrs.get("author_byline", ""), max_length=160)
+        if primary_author and not attrs.get("author_byline") and not getattr(self.instance, "author_byline", ""):
+            attrs["author_byline"] = primary_author.display_name
+        if "moderation_notes" in attrs:
+            attrs["moderation_notes"] = sanitize_text(attrs.get("moderation_notes", ""), max_length=1000)
+        if "seo" in attrs:
+            attrs["seo"] = sanitize_json_payload(attrs.get("seo"))
 
         return attrs
 
@@ -1315,22 +1466,28 @@ class PostSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         categories = validated_data.pop("categories", [])
         tags = validated_data.pop("tags", [])
+        related_posts = validated_data.pop("related_posts", [])
         post = super().create(validated_data)
         if categories:
             post.categories.set(categories)
         if tags:
             post.tags.set(tags)
+        if related_posts:
+            post.related_posts.set(related_posts)
         return post
 
     @transaction.atomic
     def update(self, instance, validated_data):
         categories = validated_data.pop("categories", None)
         tags = validated_data.pop("tags", None)
+        related_posts = validated_data.pop("related_posts", None)
         post = super().update(instance, validated_data)
         if categories is not None:
             post.categories.set(categories)
         if tags is not None:
             post.tags.set(tags)
+        if related_posts is not None:
+            post.related_posts.set(related_posts)
         return post
 
 
@@ -1630,9 +1787,188 @@ class AuthBootstrapSerializer(serializers.Serializer):
     password = serializers.CharField(min_length=8, max_length=128, write_only=True)
 
 
+class AuthRegisterSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    username = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    display_name = serializers.CharField(max_length=160, required=False, allow_blank=True)
+    avatar_url = serializers.URLField(max_length=600, required=False, allow_blank=True)
+    profile_bio = serializers.CharField(max_length=2000, required=False, allow_blank=True)
+    password = serializers.CharField(min_length=12, max_length=128, write_only=True)
+    accept_terms = serializers.BooleanField(required=False, default=True)
+    marketing_opt_in = serializers.BooleanField(required=False, default=False)
+
+    def validate_password(self, value: str) -> str:
+        password_validation.validate_password(value)
+        return value
+
+    def validate_email(self, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if not normalized:
+            raise serializers.ValidationError("Email is required.")
+        return normalized
+
+
 class AuthLoginSerializer(serializers.Serializer):
-    username = serializers.CharField(max_length=150)
+    identifier = serializers.CharField(max_length=254, required=False, allow_blank=True)
+    username = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
     password = serializers.CharField(max_length=128, write_only=True)
+
+    def validate(self, attrs):
+        identifier = (
+            attrs.get("identifier")
+            or attrs.get("username")
+            or attrs.get("email")
+            or ""
+        ).strip()
+        if not identifier:
+            raise serializers.ValidationError({"identifier": "Provide username or email."})
+        attrs["identifier"] = identifier
+        return attrs
+
+
+class AuthChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(max_length=128, write_only=True)
+    new_password = serializers.CharField(min_length=12, max_length=128, write_only=True)
+
+    def validate_new_password(self, value: str) -> str:
+        password_validation.validate_password(value)
+        return value
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    token = serializers.CharField(max_length=256)
+    password = serializers.CharField(min_length=12, max_length=128, write_only=True)
+
+    def validate_password(self, value: str) -> str:
+        password_validation.validate_password(value)
+        return value
+
+
+class EmailVerificationRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=False, allow_blank=True)
+
+
+class EmailVerificationConfirmSerializer(serializers.Serializer):
+    token = serializers.CharField(max_length=256)
+
+
+class AuthTokenRefreshSerializer(serializers.Serializer):
+    refresh_token = serializers.CharField(max_length=256)
+
+
+class AuthTokenRevokeSerializer(serializers.Serializer):
+    refresh_token = serializers.CharField(max_length=256)
+
+
+class APIKeyCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=120)
+    expires_in_days = serializers.IntegerField(required=False, min_value=1, max_value=3650)
+    scopes = serializers.ListField(
+        child=serializers.CharField(max_length=80),
+        required=False,
+        allow_empty=True,
+    )
+
+    def validate_scopes(self, value):
+        allowed = {
+            "sites:read",
+            "sites:write",
+            "content:read",
+            "content:write",
+            "commerce:read",
+            "commerce:write",
+            "analytics:read",
+            "forms:read",
+            "forms:write",
+            "domains:read",
+            "domains:write",
+            "webhooks:read",
+            "webhooks:write",
+        }
+        normalized = sorted({(item or "").strip().lower() for item in value if (item or "").strip()})
+        unknown = [item for item in normalized if item not in allowed]
+        if unknown:
+            raise serializers.ValidationError(f"Unsupported scopes: {', '.join(unknown)}")
+        return normalized
+
+
+class APIKeyRevokeSerializer(serializers.Serializer):
+    key_id = serializers.IntegerField(min_value=1)
+
+
+class InvitationTokenSerializer(serializers.Serializer):
+    token = serializers.CharField(min_length=16, max_length=256)
+
+
+class AuthSessionRevokeSerializer(serializers.Serializer):
+    session_id = serializers.IntegerField(min_value=1, required=False)
+    device_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs.get("session_id") and not attrs.get("device_id"):
+            raise serializers.ValidationError("Provide session_id or device_id.")
+        return attrs
+
+
+class AuthMFATOTPSetupSerializer(serializers.Serializer):
+    regenerate = serializers.BooleanField(required=False, default=True)
+    password = serializers.CharField(required=False, allow_blank=True, max_length=128, write_only=True)
+
+
+class AuthMFATOTPVerifySerializer(serializers.Serializer):
+    code = serializers.RegexField(r"^\d{6}$")
+
+
+class AuthMFABackupCodeSerializer(serializers.Serializer):
+    totp_code = serializers.RegexField(r"^\d{6}$", required=False, allow_blank=True)
+    recovery_code = serializers.CharField(required=False, allow_blank=True, max_length=32)
+
+    def validate(self, attrs):
+        if not (attrs.get("totp_code") or attrs.get("recovery_code")):
+            raise serializers.ValidationError("Provide totp_code or recovery_code.")
+        return attrs
+
+
+class AuthMFAChallengeVerifySerializer(serializers.Serializer):
+    challenge_token = serializers.CharField(max_length=256)
+    totp_code = serializers.RegexField(r"^\d{6}$", required=False, allow_blank=True)
+    recovery_code = serializers.CharField(required=False, allow_blank=True, max_length=32)
+
+    def validate(self, attrs):
+        if not (attrs.get("totp_code") or attrs.get("recovery_code")):
+            raise serializers.ValidationError("Provide totp_code or recovery_code.")
+        return attrs
+
+
+class AuthSocialLoginSerializer(serializers.Serializer):
+    provider = serializers.CharField(max_length=60)
+    access_token = serializers.CharField(max_length=2048)
+
+
+class UserActivitySerializer(serializers.ModelSerializer):
+    actor_username = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = SecurityAuditLog
+        fields = [
+            "id",
+            "created_at",
+            "action",
+            "actor",
+            "actor_username",
+            "target_type",
+            "target_id",
+            "request_id",
+            "ip_address",
+            "success",
+            "metadata",
+        ]
+        read_only_fields = fields
 
 
 class PublicFormSubmissionSerializer(serializers.Serializer):
@@ -1650,9 +1986,15 @@ class PublicCommentSubmissionSerializer(serializers.Serializer):
     body = serializers.CharField(max_length=5000)
 
     def validate_body(self, value: str) -> str:
-        normalized = (value or "").strip()
+        normalized = sanitize_text(value or "", max_length=5000).strip()
         if not normalized:
             raise serializers.ValidationError("Comment body cannot be empty.")
+        return normalized
+
+    def validate_author_name(self, value: str) -> str:
+        normalized = sanitize_text(value or "", max_length=140).strip()
+        if not normalized:
+            raise serializers.ValidationError("Author name cannot be empty.")
         return normalized
 
 
@@ -2006,6 +2348,201 @@ class MediaFolderSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class AssetUsageReferenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetUsageReference
+        fields = [
+            "id",
+            "site",
+            "asset",
+            "entity_type",
+            "entity_id",
+            "field_name",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        site = attrs.get("site") or getattr(self.instance, "site", None)
+        asset = attrs.get("asset") or getattr(self.instance, "asset", None)
+        if site and asset and asset.site_id != site.id:
+            raise serializers.ValidationError({"asset": "Asset must belong to the same site."})
+        if "entity_type" in attrs:
+            attrs["entity_type"] = sanitize_text(attrs.get("entity_type", ""), max_length=80)
+        if "entity_id" in attrs:
+            attrs["entity_id"] = sanitize_text(attrs.get("entity_id", ""), max_length=120)
+        if "field_name" in attrs:
+            attrs["field_name"] = sanitize_text(attrs.get("field_name", ""), max_length=120)
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
+        return attrs
+
+
+class ReusableSectionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReusableSection
+        fields = [
+            "id",
+            "site",
+            "name",
+            "slug",
+            "description",
+            "schema",
+            "status",
+            "published_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["published_at"]
+
+    def validate(self, attrs):
+        site = attrs.get("site") or getattr(self.instance, "site", None)
+        name = attrs.get("name") or getattr(self.instance, "name", "section")
+        query = ReusableSection.objects.filter(site=site)
+        if self.instance:
+            query = query.exclude(pk=self.instance.pk)
+        attrs["slug"] = unique_slug(
+            value=attrs.get("slug") or name,
+            queryset=query,
+            fallback="section",
+            max_length=180,
+        )
+        if "description" in attrs:
+            attrs["description"] = sanitize_text(attrs.get("description", ""), max_length=2000)
+        if "schema" in attrs:
+            attrs["schema"] = sanitize_json_payload(attrs.get("schema"), max_depth=8)
+        return attrs
+
+
+class ThemeTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ThemeTemplate
+        fields = [
+            "id",
+            "site",
+            "name",
+            "slug",
+            "description",
+            "is_global",
+            "tokens",
+            "breakpoints",
+            "status",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        name = attrs.get("name") or getattr(self.instance, "name", "theme")
+        slug_candidate = attrs.get("slug") or name
+        site = attrs.get("site", getattr(self.instance, "site", None))
+        is_global = bool(attrs.get("is_global", getattr(self.instance, "is_global", False)))
+        query = ThemeTemplate.objects.filter(is_global=is_global)
+        if not is_global:
+            query = query.filter(site=site)
+        if self.instance:
+            query = query.exclude(pk=self.instance.pk)
+        attrs["slug"] = unique_slug(
+            value=slug_candidate,
+            queryset=query,
+            fallback="theme",
+            max_length=180,
+        )
+        if "description" in attrs:
+            attrs["description"] = sanitize_text(attrs.get("description", ""), max_length=4000)
+        if "tokens" in attrs:
+            attrs["tokens"] = sanitize_json_payload(attrs.get("tokens"), max_depth=8)
+        if "breakpoints" in attrs:
+            attrs["breakpoints"] = sanitize_json_payload(attrs.get("breakpoints"), max_depth=5)
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
+        return attrs
+
+
+class SiteShellSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteShell
+        fields = [
+            "id",
+            "site",
+            "header_menu",
+            "footer_menu",
+            "header_settings",
+            "footer_settings",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        site = attrs.get("site") or getattr(self.instance, "site", None)
+        for field_name in ("header_menu", "footer_menu"):
+            menu = attrs.get(field_name) or getattr(self.instance, field_name, None)
+            if site and menu and menu.site_id != site.id:
+                raise serializers.ValidationError({field_name: "Menu must belong to the same site."})
+        if "header_settings" in attrs:
+            attrs["header_settings"] = sanitize_json_payload(attrs.get("header_settings"))
+        if "footer_settings" in attrs:
+            attrs["footer_settings"] = sanitize_json_payload(attrs.get("footer_settings"))
+        return attrs
+
+
+class PublishSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PublishSnapshot
+        fields = [
+            "id",
+            "site",
+            "target_type",
+            "target_id",
+            "revision_label",
+            "snapshot",
+            "actor",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["actor"]
+
+    def validate(self, attrs):
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
+        if "snapshot" in attrs:
+            attrs["snapshot"] = sanitize_json_payload(attrs.get("snapshot"), max_depth=10)
+        return attrs
+
+
+class PreviewTokenSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PreviewToken
+        fields = [
+            "id",
+            "site",
+            "page",
+            "locale",
+            "expires_at",
+            "used_at",
+            "revoked_at",
+            "created_by",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["used_at", "revoked_at", "created_by"]
+
+    def validate(self, attrs):
+        site = attrs.get("site") or getattr(self.instance, "site", None)
+        page = attrs.get("page") or getattr(self.instance, "page", None)
+        locale = attrs.get("locale") or getattr(self.instance, "locale", None)
+        if site and page and page.site_id != site.id:
+            raise serializers.ValidationError({"page": "Page must belong to the same site."})
+        if site and locale and locale.site_id != site.id:
+            raise serializers.ValidationError({"locale": "Locale must belong to the same site."})
+        if "metadata" in attrs:
+            attrs["metadata"] = sanitize_json_payload(attrs.get("metadata"))
+        return attrs
+
+
 class NavigationMenuSerializer(serializers.ModelSerializer):
     class Meta:
         model = NavigationMenu
@@ -2244,6 +2781,7 @@ class WorkspaceMembershipSerializer(serializers.ModelSerializer):
             "user",
             "user_id",
             "role",
+            "status",
             "can_manage_members",
             "can_edit_content",
             "invited_at",
@@ -2323,7 +2861,10 @@ class WorkspaceSerializer(serializers.ModelSerializer):
             return None
         if obj.owner_id == request.user.id:
             return WorkspaceMembership.ROLE_OWNER
-        membership = obj.memberships.filter(user=request.user).first()
+        membership = obj.memberships.filter(
+            user=request.user,
+            status=WorkspaceMembership.STATUS_ACTIVE,
+        ).first()
         return membership.role if membership else None
 
     def validate_settings(self, value):
@@ -2356,6 +2897,31 @@ class InviteMemberSerializer(serializers.Serializer):
 class ChangeMemberRoleSerializer(serializers.Serializer):
     """Serializer for changing a member's role."""
     role = serializers.ChoiceField(choices=WorkspaceMembership.ROLE_CHOICES)
+
+
+class SiteMembershipSerializer(serializers.ModelSerializer):
+    user = UserMinimalSerializer(read_only=True)
+
+    class Meta:
+        model = SiteMembership
+        fields = [
+            "id",
+            "site",
+            "user",
+            "role",
+            "status",
+            "granted_by",
+            "accepted_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["granted_by", "accepted_at", "created_at", "updated_at"]
+
+
+class SiteMembershipUpsertSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField(min_value=1)
+    role = serializers.ChoiceField(choices=SiteMembership.ROLE_CHOICES)
+    status = serializers.ChoiceField(choices=SiteMembership.STATUS_CHOICES, required=False)
 
 
 # Email Hosting Serializers

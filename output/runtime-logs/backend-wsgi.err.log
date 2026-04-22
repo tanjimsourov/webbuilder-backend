@@ -1,4 +1,0 @@
-  File "<string>", line 1
-    import os; os.environ.setdefault(DJANGO_SETTINGS_MODULE,config.settings); from config.wsgi import application; from wsgiref.simple_server import make_server; make_server(127.0.0.1,8000,application).serve_forever()
-                                                                                                                                                                              ^^^^^^^
-SyntaxError: invalid syntax. Perhaps you forgot a comma?

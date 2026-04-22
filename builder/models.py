@@ -9,7 +9,7 @@ from analytics.models import (  # noqa: F401
     SearchConsoleCredential,
     TrackedKeyword,
 )
-from blog.models import Comment, Post, PostCategory, PostTag  # noqa: F401
+from blog.models import BlogAuthor, Comment, Post, PostCategory, PostTag  # noqa: F401
 from commerce.models import (  # noqa: F401
     Cart,
     CartItem,
@@ -25,20 +25,31 @@ from commerce.models import (  # noqa: F401
 )
 from core.models import Site, SiteLocale, TimeStampedModel, Workspace, WorkspaceInvitation, WorkspaceMembership  # noqa: F401
 from cms.models import (  # noqa: F401
+    AssetUsageReference,
     BlockTemplate,
     MediaAsset,
     MediaFolder,
     NavigationMenu,
     Page,
     PageTranslation,
+    PreviewToken,
+    PublishSnapshot,
+    ReusableSection,
     RobotsTxt,
+    SiteShell,
+    ThemeTemplate,
     URLRedirect,
 )
 from cms.page_schema import PAGE_SCHEMA_VERSION
 from domains.models import Domain, DomainAvailability, DomainContact  # noqa: F401
 from forms.models import Form, FormSubmission  # noqa: F401
 from jobs.models import Job  # noqa: F401
-from notifications.models import Webhook, WebhookDelivery  # noqa: F401
+from notifications.models import (  # noqa: F401
+    AutomationWebhook,
+    AutomationWebhookDelivery,
+    Webhook,
+    WebhookDelivery,
+)
 from email_hosting.models import EmailDomain, EmailProvisioningTask, MailAlias, Mailbox  # noqa: F401
 
 class PageExperiment(TimeStampedModel):

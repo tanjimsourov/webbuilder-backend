@@ -1,18 +1,22 @@
+import hashlib
 import secrets
+from datetime import timedelta
 
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.conf import settings
+from django.core.mail import send_mail
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core import signing
 from django.db import models
 from django.http import Http404, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
 from django.utils.decorators import method_decorator
+from django.utils.crypto import constant_time_compare
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils import timezone
 from django.utils.html import strip_tags
 from django.contrib.syndication.views import Feed
-from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from rest_framework import permissions, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -24,6 +28,44 @@ from cms.page_schema import extract_page_summary, extract_render_cache, normaliz
 
 # Runtime helpers continue to live in this module during the app split.
 from .commerce_runtime import calculate_cart_pricing, shipping_country_for, shipping_state_for  # noqa: F401
+from core.models import (
+    MFARecoveryCode,
+    MFATOTPDevice,
+    PersonalAPIKey,
+    SecurityAuditLog,
+    SecurityToken,
+    SiteMembership,
+    UserAccount,
+    UserSecurityState,
+    UserSession,
+)
+from blog.services import evaluate_comment_spam
+from shared.auth.audit import log_security_event
+from shared.auth.lockout import (
+    clear_login_failures,
+    login_backoff_wait_seconds,
+    record_failed_login,
+    user_is_locked,
+)
+from shared.auth.mfa import (
+    build_totp_uri,
+    generate_recovery_codes,
+    generate_totp_secret,
+    hash_recovery_code,
+    verify_recovery_code,
+    verify_totp,
+)
+from shared.auth.sessions import active_sessions_for_user, revoke_other_sessions, revoke_session, start_user_session
+from shared.auth.social import registry as social_provider_registry
+from shared.auth.tokens import (
+    consume_security_token,
+    issue_security_token,
+    revoke_all_refresh_tokens,
+    revoke_refresh_token,
+    rotate_refresh_token,
+)
+from shared.contracts.sanitize import sanitize_json_payload, sanitize_text
+from shared.policies.access import SitePermission
 
 
 class SiteObjectPermission(permissions.BasePermission):
@@ -37,17 +79,44 @@ class SiteObjectPermission(permissions.BasePermission):
         site = view.get_site_for_object(obj)
         if site is None:
             return False
-        from .workspace_views import check_site_permission
+        required_permission = (
+            getattr(view, "site_read_permission", SitePermission.VIEW)
+            if request.method in permissions.SAFE_METHODS
+            else getattr(view, "site_write_permission", SitePermission.EDIT)
+        )
+        from shared.policies.access import has_site_permission
 
-        require_edit = request.method not in permissions.SAFE_METHODS
-        return check_site_permission(request.user, site, require_edit=require_edit)
+        return has_site_permission(request.user, site, required_permission)
 
 
 class SitePermissionMixin:
     """Mixin to filter querysets by user's workspace permissions."""
 
     site_lookup_field = "site"
+    site_read_permission = SitePermission.VIEW
+    site_write_permission = SitePermission.EDIT
     permission_classes = [permissions.IsAuthenticated, SiteObjectPermission]
+
+    def _api_key_for_request(self):
+        key = getattr(self.request, "auth_api_key", None)
+        if key is not None:
+            return key
+        auth_obj = getattr(self.request, "auth", None)
+        return auth_obj if isinstance(auth_obj, PersonalAPIKey) else None
+
+    def _assert_scope(self, *, write: bool) -> None:
+        key = self._api_key_for_request()
+        if key is None:
+            return
+        scopes = set(key.scopes or [])
+        read_scopes = {"sites:read", "content:read", "commerce:read", "analytics:read", "forms:read", "domains:read"}
+        write_scopes = {"sites:write", "content:write", "commerce:write", "forms:write", "domains:write", "webhooks:write"}
+        if write:
+            if not (scopes & write_scopes):
+                raise PermissionDenied("API key scope does not allow write access.")
+        else:
+            if not (scopes & (read_scopes | write_scopes)):
+                raise PermissionDenied("API key scope does not allow read access.")
 
     def _site_from_candidate(self, candidate):
         if candidate is None:
@@ -82,6 +151,8 @@ class SitePermissionMixin:
     def filter_by_site_permission(self, queryset):
         """Filter queryset to only include items from sites the user can access."""
         from .workspace_views import filter_sites_by_permission
+
+        self._assert_scope(write=False)
         user = self.request.user
         if user.is_superuser:
             return queryset
@@ -92,6 +163,7 @@ class SitePermissionMixin:
         return queryset.filter(**{f"{self.site_lookup_field}__in": accessible_sites}).distinct()
 
     def get_site_from_request(self, *, key: str = "site", source: str = "query", require_edit: bool = False):
+        self._assert_scope(write=require_edit)
         if source == "query":
             raw_site_id = self.request.query_params.get(key)
         else:
@@ -106,17 +178,24 @@ class SitePermissionMixin:
         if require_edit:
             self.check_site_edit_permission(site)
         else:
-            from .workspace_views import check_site_permission
+            from shared.policies.access import has_site_permission
 
-            if not check_site_permission(self.request.user, site, require_edit=False):
+            if not has_site_permission(self.request.user, site, self.site_read_permission):
                 raise PermissionDenied("You don't have permission to access this site.")
         return site
 
     def check_site_edit_permission(self, site):
         """Check if user can edit content on this site."""
-        from .workspace_views import check_site_permission
-        if not check_site_permission(self.request.user, site, require_edit=True):
+        self._assert_scope(write=True)
+        from shared.policies.access import has_site_permission
+
+        if not has_site_permission(self.request.user, site, self.site_write_permission):
             raise PermissionDenied("You don't have permission to edit this site.")
+
+    def check_site_manage_permission(self, site):
+        from shared.policies.access import has_site_permission
+
+        return has_site_permission(self.request.user, site, SitePermission.MANAGE)
 
     def perform_create(self, serializer):
         site = self.get_site_from_serializer(serializer)
@@ -134,6 +213,8 @@ class SitePermissionMixin:
 
 
 from .models import (
+    AssetUsageReference,
+    BlogAuthor,
     BlockTemplate,
     Cart,
     CartItem,
@@ -157,9 +238,12 @@ from .models import (
     Post,
     PostCategory,
     PostTag,
+    PreviewToken,
+    PublishSnapshot,
     Product,
     ProductCategory,
     ProductVariant,
+    ReusableSection,
     ShippingRate,
     ShippingZone,
     KeywordRankEntry,
@@ -169,7 +253,9 @@ from .models import (
     SEOSettings,
     Site,
     SiteLocale,
+    SiteShell,
     TaxRate,
+    ThemeTemplate,
     TrackedKeyword,
     URLRedirect,
     Webhook,
@@ -196,8 +282,22 @@ from .localization import (
 from .mirror_import import import_mirrored_site
 from .jobs import queue_search_index
 from .serializers import (
+    AssetUsageReferenceSerializer,
+    APIKeyRevokeSerializer,
+    APIKeyCreateSerializer,
+    AuthChangePasswordSerializer,
     AuthBootstrapSerializer,
     AuthLoginSerializer,
+    AuthMFABackupCodeSerializer,
+    AuthMFAChallengeVerifySerializer,
+    AuthMFATOTPSetupSerializer,
+    AuthMFATOTPVerifySerializer,
+    AuthRegisterSerializer,
+    AuthSessionRevokeSerializer,
+    AuthSocialLoginSerializer,
+    AuthTokenRefreshSerializer,
+    AuthTokenRevokeSerializer,
+    BlogAuthorSerializer,
     BlockTemplateSerializer,
     BuilderSaveSerializer,
     CartSerializer,
@@ -217,6 +317,7 @@ from .serializers import (
     PageReviewSerializer,
     PageSerializer,
     PageTranslationSerializer,
+    PaymentIntentSerializer,
     PublicCommentSubmissionSerializer,
     PublicCartAddSerializer,
     PublicCartItemUpdateSerializer,
@@ -225,6 +326,8 @@ from .serializers import (
     PostCategorySerializer,
     PostSerializer,
     PostTagSerializer,
+    PreviewTokenSerializer,
+    PublishSnapshotSerializer,
     ProductCategorySerializer,
     ProductSerializer,
     ProductVariantSerializer,
@@ -234,10 +337,14 @@ from .serializers import (
     SEOAnalyticsSerializer,
     SEOAuditSerializer,
     SEOSettingsSerializer,
+    ReusableSectionSerializer,
     ShippingRateSerializer,
     ShippingZoneSerializer,
     SiteSerializer,
     SiteLocaleSerializer,
+    SiteMembershipSerializer,
+    SiteMembershipUpsertSerializer,
+    SiteShellSerializer,
     SiteMirrorImportSerializer,
     TaxRateSerializer,
     TrackedKeywordSerializer,
@@ -247,8 +354,14 @@ from .serializers import (
     WorkspaceMembershipSerializer,
     WorkspaceInvitationSerializer,
     InviteMemberSerializer,
+    EmailVerificationConfirmSerializer,
+    EmailVerificationRequestSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
     ChangeMemberRoleSerializer,
     CollaboratorUserSerializer,
+    UserActivitySerializer,
+    ThemeTemplateSerializer,
 )
 from .services import (
     BASE_BLOCK_CSS,
@@ -272,10 +385,42 @@ from .services import (
     starter_kits,
     trigger_webhooks,
 )
-from .search_services import search_service
+from shared.search.service import search_index
 
 
 User = get_user_model()
+
+
+def _snapshot_payload_for_content(instance) -> dict:
+    payload: dict[str, object] = {
+        "id": getattr(instance, "id", None),
+        "updated_at": getattr(instance, "updated_at", None).isoformat() if getattr(instance, "updated_at", None) else None,
+    }
+    for field in ("title", "slug", "path", "status", "seo", "page_settings", "builder_data", "html", "css", "js"):
+        if hasattr(instance, field):
+            payload[field] = getattr(instance, field)
+    return payload
+
+
+def create_publish_snapshot(
+    *,
+    site: Site,
+    target_type: str,
+    target_id: int,
+    instance,
+    actor=None,
+    revision_label: str = "",
+    metadata: dict | None = None,
+) -> PublishSnapshot:
+    return PublishSnapshot.objects.create(
+        site=site,
+        target_type=target_type,
+        target_id=target_id,
+        revision_label=revision_label,
+        snapshot=_snapshot_payload_for_content(instance),
+        actor=actor if actor and getattr(actor, "is_authenticated", False) else None,
+        metadata=metadata or {},
+    )
 
 
 class DashboardSummaryView(APIView):
@@ -345,7 +490,7 @@ class WorkspaceSearchView(APIView):
         results: list[dict[str, object]] = []
         backend_name = "orm"
 
-        if search_service.enabled:
+        if search_index.is_enabled():
             results = self._search_meilisearch(query, site_map, limit, request)
             if results:
                 backend_name = "meilisearch"
@@ -356,8 +501,8 @@ class WorkspaceSearchView(APIView):
         return Response({"results": results[:limit], "query": query, "backend": backend_name})
 
     def _search_meilisearch(self, query: str, site_map: dict[int, Site], limit: int, request) -> list[dict[str, object]]:
-        search_service.setup_indexes()
-        raw_results = search_service.search_all(query, site_id=None, limit_per_index=max(1, min(limit, 5)))
+        search_index.ensure_indexes()
+        raw_results = search_index.search_all(query=query, site_id=None, limit_per_index=max(1, min(limit, 5)))
         if not raw_results:
             return []
 
@@ -552,15 +697,33 @@ class AuthStatusView(APIView):
 
     def get(self, request):
         user = request.user if request.user.is_authenticated else None
+        email_verified = False
+        mfa_enabled = False
+        account_status = None
+        impersonating = False
+        if user:
+            account, _ = UserAccount.objects.get_or_create(
+                user=user,
+                defaults={"email": (user.email or f"user-{user.pk}@local.invalid").strip().lower()},
+            )
+            email_verified = bool(account.email_verified_at)
+            mfa_enabled = bool(account.mfa_enabled)
+            account_status = account.status
+            impersonating = bool(request.session.get("impersonator_user_id"))
         return Response(
             {
                 "authenticated": bool(user),
                 "has_users": User.objects.exists(),
                 "user": (
                     {
+                        "id": user.id,
                         "username": user.username,
                         "email": user.email,
                         "is_superuser": user.is_superuser,
+                        "email_verified": email_verified,
+                        "mfa_enabled": mfa_enabled,
+                        "account_status": account_status,
+                        "impersonating": impersonating,
                     }
                     if user
                     else None
@@ -569,6 +732,7 @@ class AuthStatusView(APIView):
         )
 
 
+@method_decorator(csrf_protect, name="dispatch")
 class AuthBootstrapView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = []
@@ -593,7 +757,14 @@ class AuthBootstrapView(APIView):
                 request.headers.get("X-Bootstrap-Token")
                 or request.data.get("bootstrap_token", "")
             )
-            if not secrets.compare_digest(str(provided_token), bootstrap_token):
+            if not constant_time_compare(str(provided_token), bootstrap_token):
+                log_security_event(
+                    "auth.bootstrap.failed",
+                    request=request,
+                    actor=request.user if request.user.is_authenticated else None,
+                    success=False,
+                    metadata={"reason": "invalid_bootstrap_token"},
+                )
                 return Response(
                     {"detail": "Invalid bootstrap token."},
                     status=status.HTTP_403_FORBIDDEN,
@@ -607,6 +778,12 @@ class AuthBootstrapView(APIView):
                 # Use select_for_update to lock and prevent race condition
                 # Check inside transaction to ensure atomicity
                 if User.objects.select_for_update().exists():
+                    log_security_event(
+                        "auth.bootstrap.failed",
+                        request=request,
+                        success=False,
+                        metadata={"reason": "bootstrap_already_completed"},
+                    )
                     return Response(
                         {"detail": "Bootstrap is disabled after the first user is created."},
                         status=status.HTTP_400_BAD_REQUEST
@@ -618,17 +795,32 @@ class AuthBootstrapView(APIView):
                     password=serializer.validated_data["password"],
                 )
         except IntegrityError:
+            log_security_event(
+                "auth.bootstrap.failed",
+                request=request,
+                success=False,
+                metadata={"reason": "integrity_error"},
+            )
             return Response(
                 {"detail": "Bootstrap is disabled after the first user is created."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         login(request, user)
+        start_user_session(request=request, user=user, auth_method=UserSession.AUTH_SESSION)
+        log_security_event(
+            "auth.bootstrap.success",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+        )
         return Response(
             {
                 "authenticated": True,
                 "has_users": True,
                 "user": {
+                    "id": user.id,
                     "username": user.username,
                     "email": user.email,
                     "is_superuser": user.is_superuser,
@@ -638,6 +830,121 @@ class AuthBootstrapView(APIView):
         )
 
 
+def _ensure_user_account(user):
+    account, _ = UserAccount.objects.get_or_create(
+        user=user,
+        defaults={
+            "email": (user.email or f"user-{user.pk}@local.invalid").strip().lower(),
+            "display_name": (user.get_full_name() or user.username).strip()[:160],
+            "status": UserAccount.STATUS_ACTIVE if user.is_active else UserAccount.STATUS_SUSPENDED,
+        },
+    )
+    return account
+
+
+def _build_access_token_for_user(user) -> tuple[str, int]:
+    state, _ = UserSecurityState.objects.get_or_create(user=user)
+    now_ts = int(timezone.now().timestamp())
+    ttl = int(getattr(settings, "AUTH_ACCESS_TOKEN_TTL_SECONDS", 900))
+    access_token = signing.dumps(
+        {
+            "sub": user.pk,
+            "iat": now_ts,
+            "exp": now_ts + ttl,
+            "ver": int(state.access_token_version or 1),
+        },
+        salt="wb.auth.access.v1",
+        compress=True,
+    )
+    return access_token, ttl
+
+
+def _auth_user_payload(user, *, request, include_security: bool = True) -> dict[str, object]:
+    account = _ensure_user_account(user)
+    payload: dict[str, object] = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_superuser": user.is_superuser,
+    }
+    if include_security:
+        payload.update(
+            {
+                "email_verified": bool(account.email_verified_at),
+                "mfa_enabled": bool(account.mfa_enabled),
+                "account_status": account.status,
+                "impersonating": bool(request.session.get("impersonator_user_id")),
+            }
+        )
+    return payload
+
+
+@method_decorator(csrf_protect, name="dispatch")
+class AuthRegisterView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthRegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"].strip().lower()
+        username = serializer.validated_data.get("username", "").strip()
+        if not username:
+            base = email.split("@")[0] or "user"
+            username = base
+            suffix = 2
+            while User.objects.filter(username=username).exists():
+                username = f"{base}{suffix}"
+                suffix += 1
+        if User.objects.filter(email__iexact=email).exists():
+            return Response({"detail": "A user with this email already exists."}, status=status.HTTP_409_CONFLICT)
+        user = User.objects.create_user(
+            username=username,
+            email=email,
+            password=serializer.validated_data["password"],
+            is_active=True,
+        )
+        account = _ensure_user_account(user)
+        account.status = UserAccount.STATUS_ACTIVE
+        if serializer.validated_data.get("display_name"):
+            account.display_name = serializer.validated_data["display_name"].strip()[:160]
+        if serializer.validated_data.get("avatar_url"):
+            account.avatar_url = serializer.validated_data["avatar_url"]
+        if serializer.validated_data.get("profile_bio"):
+            account.profile_bio = serializer.validated_data["profile_bio"]
+        if serializer.validated_data.get("accept_terms"):
+            account.terms_accepted_at = timezone.now()
+            account.privacy_accepted_at = timezone.now()
+            account.data_processing_consent_at = timezone.now()
+        account.marketing_opt_in = bool(serializer.validated_data.get("marketing_opt_in", False))
+        account.save()
+
+        login(request, user)
+        start_user_session(request=request, user=user, auth_method=UserSession.AUTH_SESSION)
+        log_security_event(
+            "auth.register",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+            metadata={"email": email},
+        )
+        return Response(
+            {
+                "authenticated": True,
+                "has_users": True,
+                "user": _auth_user_payload(user, request=request),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+@method_decorator(csrf_protect, name="dispatch")
 class AuthLoginView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = []
@@ -650,33 +957,136 @@ class AuthLoginView(APIView):
     def post(self, request):
         serializer = AuthLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        identifier = serializer.validated_data["identifier"]
+        client_ip = (request.META.get("HTTP_X_FORWARDED_FOR") or request.META.get("REMOTE_ADDR") or "").split(",")[0].strip()
+
+        wait_seconds = login_backoff_wait_seconds(identifier, client_ip)
+        if wait_seconds > 0:
+            response = Response(
+                {"detail": "Too many authentication attempts. Please try again shortly."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+            response["Retry-After"] = str(wait_seconds)
+            return response
+
+        candidate_user = User.objects.filter(models.Q(username__iexact=identifier) | models.Q(email__iexact=identifier)).first()
+        username = candidate_user.username if candidate_user else identifier
+        if candidate_user is not None:
+            account = _ensure_user_account(candidate_user)
+            if account.status in {UserAccount.STATUS_DELETED, UserAccount.STATUS_SUSPENDED}:
+                return Response({"detail": "Account is disabled."}, status=status.HTTP_403_FORBIDDEN)
+            locked, retry_after = user_is_locked(candidate_user)
+            if locked:
+                log_security_event(
+                    "auth.login.locked",
+                    request=request,
+                    actor=candidate_user,
+                    target_type="user",
+                    target_id=str(candidate_user.pk),
+                    success=False,
+                    metadata={"retry_after": retry_after},
+                )
+                response = Response(
+                    {"detail": "Account temporarily locked due to repeated failed attempts."},
+                    status=status.HTTP_423_LOCKED,
+                )
+                response["Retry-After"] = str(retry_after)
+                return response
+
         user = authenticate(
             request,
-            username=serializer.validated_data["username"],
+            username=username,
             password=serializer.validated_data["password"],
         )
         if not user:
+            locked, retry_after = record_failed_login(username=identifier, ip=client_ip, user=candidate_user)
+            log_security_event(
+                "auth.login.failed",
+                request=request,
+                actor=candidate_user,
+                target_type="user",
+                target_id=str(candidate_user.pk) if candidate_user else "",
+                success=False,
+                metadata={"locked": locked, "retry_after": retry_after},
+            )
+            if locked:
+                response = Response(
+                    {"detail": "Account temporarily locked due to repeated failed attempts."},
+                    status=status.HTTP_423_LOCKED,
+                )
+                response["Retry-After"] = str(retry_after)
+                return response
             return Response({"detail": "Invalid username or password."}, status=status.HTTP_400_BAD_REQUEST)
 
+        account = _ensure_user_account(user)
+        if account.status in {UserAccount.STATUS_DELETED, UserAccount.STATUS_SUSPENDED}:
+            return Response({"detail": "Account is disabled."}, status=status.HTTP_403_FORBIDDEN)
+
+        clear_login_failures(username=identifier, ip=client_ip, user=user)
+
+        if account.mfa_enabled:
+            challenge_token, _ = issue_security_token(
+                user=user,
+                purpose=SecurityToken.PURPOSE_MFA_CHALLENGE,
+                ttl_seconds=getattr(settings, "AUTH_MFA_CHALLENGE_TTL_SECONDS", 300),
+                request=request,
+                metadata={"identifier": identifier},
+            )
+            log_security_event(
+                "auth.login.mfa_challenge",
+                request=request,
+                actor=user,
+                target_type="user",
+                target_id=str(user.pk),
+            )
+            return Response(
+                {
+                    "mfa_required": True,
+                    "challenge_token": challenge_token,
+                    "methods": ["totp", "recovery_code"],
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
         login(request, user)
+        request.session.set_expiry(getattr(settings, "SESSION_COOKIE_AGE", 1209600))
+        start_user_session(request=request, user=user, auth_method=UserSession.AUTH_SESSION)
+        log_security_event(
+            "auth.login.success",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+        )
         return Response(
             {
                 "authenticated": True,
                 "has_users": True,
-                "user": {
-                    "username": user.username,
-                    "email": user.email,
-                    "is_superuser": user.is_superuser,
-                },
+                "user": _auth_user_payload(user, request=request),
             }
         )
 
 
+@method_decorator(csrf_protect, name="dispatch")
 class AuthLogoutView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        actor = request.user if request.user.is_authenticated else None
+        if actor is not None:
+            revoke_all_refresh_tokens(actor)
+            active_session_id = request.session.get("active_user_session_id")
+            if active_session_id:
+                revoke_session(user=actor, session_id=int(active_session_id))
+                request.session.pop("active_user_session_id", None)
         logout(request)
+        log_security_event(
+            "auth.logout",
+            request=request,
+            actor=actor,
+            target_type="user",
+            target_id=str(actor.pk) if actor else "",
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -704,6 +1114,55 @@ class HealthCheckView(APIView):
             return Response(health, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         return Response(health)
+
+
+class LivenessCheckView(APIView):
+    """Liveness endpoint: confirms the process is serving HTTP."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        return Response({"status": "ok"})
+
+
+class ReadinessCheckView(APIView):
+    """Readiness endpoint: confirms dependencies are reachable."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        from shared.cache.bootstrap import cache_is_healthy
+        from shared.db.bootstrap import database_is_healthy
+
+        checks = {
+            "database": "ok" if database_is_healthy() else "error",
+            "cache": "ok" if cache_is_healthy() else "error",
+        }
+        status_value = "ok" if all(value == "ok" for value in checks.values()) else "degraded"
+        payload = {"status": status_value, "checks": checks}
+        if status_value != "ok":
+            return Response(payload, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response(payload)
+
+
+class VersionView(APIView):
+    """Version/build endpoint for operators and runtime debugging."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        import os
+
+        from django import get_version as django_get_version
+
+        return Response(
+            {
+                "version": (os.environ.get("APP_VERSION") or "").strip() or None,
+                "commit": (os.environ.get("GIT_SHA") or os.environ.get("COMMIT_SHA") or "").strip() or None,
+                "environment": (os.environ.get("APP_ENV") or "").strip().lower() or None,
+                "django": django_get_version(),
+            }
+        )
 
 
 class MetricsView(APIView):
@@ -774,7 +1233,19 @@ class AuthMagicLoginView(APIView):
             return Response({"detail": "username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         user = get_object_or_404(User, username=username)
+        account = _ensure_user_account(user)
+        if account.status in {UserAccount.STATUS_DELETED, UserAccount.STATUS_SUSPENDED}:
+            return Response({"detail": "Account is disabled."}, status=status.HTTP_403_FORBIDDEN)
         login(request, user)
+        start_user_session(request=request, user=user, auth_method=UserSession.AUTH_SESSION)
+        log_security_event(
+            "auth.magic_login",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+            metadata={"enabled": bool(getattr(settings, "AUTH_MAGIC_LOGIN_ENABLED", settings.DEBUG))},
+        )
 
         next_url = request.query_params.get("next") or ""
         if next_url:
@@ -792,17 +1263,866 @@ class AuthMagicLoginView(APIView):
             {
                 "authenticated": True,
                 "has_users": True,
-                "user": {
-                    "username": user.username,
-                    "email": user.email,
-                    "is_superuser": user.is_superuser,
-                },
+                "user": _auth_user_payload(user, request=request),
             }
         )
 
 
+class AuthTokenIssueView(APIView):
+    """Issue short-lived access token + rotating refresh token."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        account = _ensure_user_account(request.user)
+        if account.status in {UserAccount.STATUS_DELETED, UserAccount.STATUS_SUSPENDED, UserAccount.STATUS_LOCKED}:
+            return Response({"detail": "Account is not allowed to mint tokens."}, status=status.HTTP_403_FORBIDDEN)
+        active_session_id = request.session.get("active_user_session_id")
+        session_record = None
+        if active_session_id:
+            session_record = UserSession.objects.filter(
+                pk=active_session_id,
+                user=request.user,
+                revoked_at__isnull=True,
+            ).first()
+        if session_record is None:
+            session_record = start_user_session(request=request, user=request.user, auth_method=UserSession.AUTH_SESSION)
+
+        refresh_token, refresh_record = issue_security_token(
+            user=request.user,
+            purpose=SecurityToken.PURPOSE_REFRESH,
+            ttl_seconds=getattr(settings, "AUTH_REFRESH_TOKEN_TTL_SECONDS", 60 * 60 * 24 * 30),
+            metadata={"issued_from": "session", "session_id": session_record.id},
+            session=session_record,
+            request=request,
+        )
+        session_record.refresh_token_hash = refresh_record.token_hash
+        session_record.save(update_fields=["refresh_token_hash", "updated_at"])
+        access_token, ttl = _build_access_token_for_user(request.user)
+        log_security_event(
+            "auth.token.issue",
+            request=request,
+            actor=request.user,
+            target_type="user",
+            target_id=str(request.user.pk),
+        )
+        return Response(
+            {
+                "access_token": access_token,
+                "access_token_expires_in": ttl,
+                "refresh_token": refresh_token,
+                "session_id": session_record.id,
+            }
+        )
+
+
+class AuthTokenRefreshView(APIView):
+    """Rotate refresh token and return a new short-lived access token."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthTokenRefreshSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        rotated = rotate_refresh_token(
+            raw_token=serializer.validated_data["refresh_token"],
+            ttl_seconds=getattr(settings, "AUTH_REFRESH_TOKEN_TTL_SECONDS", 60 * 60 * 24 * 30),
+            request=request,
+        )
+        if rotated is None:
+            return Response({"detail": "Invalid refresh token."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user, new_refresh = rotated
+        account = _ensure_user_account(user)
+        if not user.is_active or account.status in {UserAccount.STATUS_DELETED, UserAccount.STATUS_SUSPENDED}:
+            return Response({"detail": "User is inactive."}, status=status.HTTP_401_UNAUTHORIZED)
+        access_token, ttl = _build_access_token_for_user(user)
+        log_security_event(
+            "auth.token.refresh",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+        )
+        return Response(
+            {
+                "access_token": access_token,
+                "access_token_expires_in": ttl,
+                "refresh_token": new_refresh,
+            }
+        )
+
+
+class AuthTokenRevokeView(APIView):
+    """Revoke a refresh token."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthTokenRevokeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        revoked = revoke_refresh_token(serializer.validated_data["refresh_token"])
+        log_security_event(
+            "auth.token.revoke",
+            request=request,
+            actor=request.user if request.user.is_authenticated else None,
+            success=revoked,
+        )
+        return Response({"revoked": bool(revoked)})
+
+
+class AuthAPIKeyListCreateView(APIView):
+    """List and create personal API keys."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def get(self, request):
+        keys = (
+            PersonalAPIKey.objects.filter(user=request.user)
+            .order_by("-created_at")
+            .values(
+                "id",
+                "name",
+                "key_prefix",
+                "scopes",
+                "created_at",
+                "expires_at",
+                "last_used_at",
+                "last_used_ip",
+                "revoked_at",
+            )
+        )
+        return Response(
+            {
+                "results": [
+                    {
+                        "id": item["id"],
+                        "name": item["name"],
+                        "token_hint": f"{item['key_prefix']}***",
+                        "scopes": item.get("scopes") or [],
+                        "created_at": item["created_at"],
+                        "expires_at": item["expires_at"],
+                        "last_used_at": item["last_used_at"],
+                        "last_used_ip": item["last_used_ip"],
+                        "revoked_at": item["revoked_at"],
+                    }
+                    for item in keys
+                ]
+            }
+        )
+
+    def post(self, request):
+        serializer = APIKeyCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        name = serializer.validated_data["name"].strip() or "default"
+        raw_key = f"wbk_{secrets.token_urlsafe(32)}"
+        key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        expires_in_days = serializer.validated_data.get("expires_in_days")
+        expires_at = timezone.now() + timedelta(days=int(expires_in_days)) if expires_in_days else None
+        scopes = serializer.validated_data.get("scopes") or ["sites:read"]
+        record = PersonalAPIKey.objects.create(
+            user=request.user,
+            name=name,
+            key_prefix=raw_key[:12],
+            key_hash=key_hash,
+            scopes=scopes,
+            expires_at=expires_at,
+        )
+        log_security_event(
+            "auth.api_key.create",
+            request=request,
+            actor=request.user,
+            target_type="api_key",
+            target_id=str(record.id),
+        )
+        return Response(
+            {
+                "id": record.id,
+                "name": record.name,
+                "token": raw_key,
+                "scopes": record.scopes,
+                "expires_at": record.expires_at,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AuthAPIKeyRevokeView(APIView):
+    """Revoke a personal API key."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request, key_id: int):
+        serializer = APIKeyRevokeSerializer(data={"key_id": key_id})
+        serializer.is_valid(raise_exception=True)
+        key = get_object_or_404(PersonalAPIKey, pk=key_id, user=request.user)
+        key.revoked_at = timezone.now()
+        key.save(update_fields=["revoked_at", "updated_at"])
+        log_security_event(
+            "auth.api_key.revoke",
+            request=request,
+            actor=request.user,
+            target_type="api_key",
+            target_id=str(key.id),
+        )
+        return Response({"revoked": True})
+
+
+class AuthEmailVerificationRequestView(APIView):
+    """Generate and dispatch single-use email verification token."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import EmailVerificationThrottle
+
+        return [EmailVerificationThrottle()]
+
+    def post(self, request):
+        serializer = EmailVerificationRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = (serializer.validated_data.get("email") or "").strip()
+        if request.user.is_authenticated:
+            target_user = request.user
+        elif email:
+            target_user = User.objects.filter(email__iexact=email).first()
+        else:
+            target_user = None
+
+        if target_user is not None and target_user.email:
+            raw_token, _ = issue_security_token(
+                user=target_user,
+                purpose=SecurityToken.PURPOSE_EMAIL_VERIFY,
+                ttl_seconds=getattr(settings, "AUTH_EMAIL_VERIFICATION_TOKEN_TTL_SECONDS", 60 * 60 * 24),
+                metadata={"email": target_user.email},
+            )
+            base_url = (getattr(settings, "APP_URL", "") or "").rstrip("/")
+            link = f"{base_url}/verify-email?token={raw_token}" if base_url else raw_token
+            send_mail(
+                subject="Verify your account email",
+                message=f"Use this verification token: {raw_token}\n\nVerification URL: {link}",
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", ""),
+                recipient_list=[target_user.email],
+                fail_silently=True,
+            )
+            log_security_event(
+                "auth.email_verification.request",
+                request=request,
+                actor=target_user if request.user.is_authenticated else None,
+                target_type="user",
+                target_id=str(target_user.pk),
+            )
+        return Response({"detail": "If the account exists, a verification email has been sent."}, status=202)
+
+
+class AuthEmailVerificationConfirmView(APIView):
+    """Consume single-use email verification token."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import EmailVerificationThrottle
+
+        return [EmailVerificationThrottle()]
+
+    def post(self, request):
+        serializer = EmailVerificationConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token_record = consume_security_token(
+            raw_token=serializer.validated_data["token"],
+            purpose=SecurityToken.PURPOSE_EMAIL_VERIFY,
+        )
+        if token_record is None:
+            return Response({"detail": "Invalid or expired verification token."}, status=status.HTTP_400_BAD_REQUEST)
+
+        state, _ = UserSecurityState.objects.get_or_create(user=token_record.user)
+        state.email_verified_at = timezone.now()
+        state.save(update_fields=["email_verified_at", "updated_at"])
+        account = _ensure_user_account(token_record.user)
+        account.email_verified_at = state.email_verified_at
+        account.save(update_fields=["email_verified_at", "updated_at"])
+        log_security_event(
+            "auth.email_verification.confirm",
+            request=request,
+            actor=token_record.user,
+            target_type="user",
+            target_id=str(token_record.user.pk),
+        )
+        return Response({"verified": True})
+
+
+class AuthPasswordResetRequestView(APIView):
+    """Generate and dispatch single-use password reset token."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import PasswordResetThrottle
+
+        return [PasswordResetThrottle()]
+
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"]
+        target_user = User.objects.filter(email__iexact=email).first()
+
+        if target_user is not None and target_user.email:
+            raw_token, _ = issue_security_token(
+                user=target_user,
+                purpose=SecurityToken.PURPOSE_PASSWORD_RESET,
+                ttl_seconds=getattr(settings, "AUTH_PASSWORD_RESET_TOKEN_TTL_SECONDS", 60 * 30),
+                metadata={"email": target_user.email},
+            )
+            base_url = (getattr(settings, "APP_URL", "") or "").rstrip("/")
+            link = f"{base_url}/reset-password?token={raw_token}" if base_url else raw_token
+            send_mail(
+                subject="Password reset request",
+                message=f"Use this reset token: {raw_token}\n\nReset URL: {link}",
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", ""),
+                recipient_list=[target_user.email],
+                fail_silently=True,
+            )
+            log_security_event(
+                "auth.password_reset.request",
+                request=request,
+                target_type="user",
+                target_id=str(target_user.pk),
+            )
+        # Avoid account enumeration
+        return Response({"detail": "If the account exists, a reset email has been sent."}, status=202)
+
+
+class AuthPasswordResetConfirmView(APIView):
+    """Consume reset token and rotate account secrets."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import PasswordResetThrottle
+
+        return [PasswordResetThrottle()]
+
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token_record = consume_security_token(
+            raw_token=serializer.validated_data["token"],
+            purpose=SecurityToken.PURPOSE_PASSWORD_RESET,
+        )
+        if token_record is None:
+            return Response({"detail": "Invalid or expired reset token."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = token_record.user
+        user.set_password(serializer.validated_data["password"])
+        user.save(update_fields=["password"])
+
+        # Revoke outstanding refresh tokens on password reset.
+        revoke_all_refresh_tokens(user)
+
+        state, _ = UserSecurityState.objects.get_or_create(user=user)
+        state.last_password_change_at = timezone.now()
+        state.failed_login_count = 0
+        state.locked_until = None
+        state.access_token_version = int(state.access_token_version or 1) + 1
+        state.save(
+            update_fields=[
+                "last_password_change_at",
+                "failed_login_count",
+                "locked_until",
+                "access_token_version",
+                "updated_at",
+            ]
+        )
+        UserSession.objects.filter(user=user, revoked_at__isnull=True).update(revoked_at=timezone.now(), updated_at=timezone.now())
+        account = _ensure_user_account(user)
+        if account.status == UserAccount.STATUS_LOCKED:
+            account.status = UserAccount.STATUS_ACTIVE
+            account.save(update_fields=["status", "updated_at"])
+
+        log_security_event(
+            "auth.password_reset.confirm",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+        )
+        return Response({"reset": True})
+
+
+class AuthChangePasswordView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthChangePasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        if not user.check_password(serializer.validated_data["current_password"]):
+            return Response({"detail": "Current password is invalid."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(serializer.validated_data["new_password"])
+        user.save(update_fields=["password"])
+
+        state, _ = UserSecurityState.objects.get_or_create(user=user)
+        state.last_password_change_at = timezone.now()
+        state.access_token_version = int(state.access_token_version or 1) + 1
+        state.failed_login_count = 0
+        state.locked_until = None
+        state.save(
+            update_fields=[
+                "last_password_change_at",
+                "access_token_version",
+                "failed_login_count",
+                "locked_until",
+                "updated_at",
+            ]
+        )
+
+        revoke_all_refresh_tokens(user)
+        current_session_id = request.session.get("active_user_session_id")
+        revoke_other_sessions(user=user, keep_session_id=current_session_id)
+        log_security_event(
+            "auth.password.change",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+        )
+        return Response({"changed": True})
+
+
+def _consume_recovery_code(*, user, code: str) -> bool:
+    code_hash = hash_recovery_code(code)
+    recovery = (
+        MFARecoveryCode.objects.filter(
+            user=user,
+            code_hash=code_hash,
+            used_at__isnull=True,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if recovery is None:
+        return False
+    if not verify_recovery_code(code, recovery.code_hash):
+        return False
+    recovery.used_at = timezone.now()
+    recovery.save(update_fields=["used_at", "updated_at"])
+    return True
+
+
+class AuthMFAChallengeVerifyView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthMFAChallengeVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token_record = consume_security_token(
+            raw_token=serializer.validated_data["challenge_token"],
+            purpose=SecurityToken.PURPOSE_MFA_CHALLENGE,
+        )
+        if token_record is None:
+            return Response({"detail": "Invalid or expired MFA challenge token."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = token_record.user
+        account = _ensure_user_account(user)
+        if not account.mfa_enabled:
+            return Response({"detail": "MFA is not enabled for this user."}, status=status.HTTP_400_BAD_REQUEST)
+
+        code = serializer.validated_data.get("totp_code") or ""
+        recovery_code = serializer.validated_data.get("recovery_code") or ""
+        device = getattr(user, "mfa_totp_device", None)
+        verified = False
+        method = ""
+        if code and device and device.is_confirmed and verify_totp(device.secret, code):
+            verified = True
+            method = "totp"
+            device.last_used_at = timezone.now()
+            device.save(update_fields=["last_used_at", "updated_at"])
+        elif recovery_code and _consume_recovery_code(user=user, code=recovery_code):
+            verified = True
+            method = "recovery_code"
+
+        if not verified:
+            log_security_event(
+                "auth.login.mfa_failed",
+                request=request,
+                actor=user,
+                target_type="user",
+                target_id=str(user.pk),
+                success=False,
+            )
+            return Response({"detail": "Invalid MFA code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        login(request, user)
+        request.session.set_expiry(getattr(settings, "SESSION_COOKIE_AGE", 1209600))
+        start_user_session(request=request, user=user, auth_method=UserSession.AUTH_SESSION)
+        state, _ = UserSecurityState.objects.get_or_create(user=user)
+        state.last_mfa_at = timezone.now()
+        state.save(update_fields=["last_mfa_at", "updated_at"])
+
+        log_security_event(
+            "auth.login.success",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+            metadata={"mfa_method": method},
+        )
+        return Response(
+            {
+                "authenticated": True,
+                "has_users": True,
+                "user": _auth_user_payload(user, request=request),
+            }
+        )
+
+
+class AuthMFATOTPSetupView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthMFATOTPSetupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if serializer.validated_data.get("password") and not request.user.check_password(serializer.validated_data["password"]):
+            return Response({"detail": "Invalid password."}, status=status.HTTP_400_BAD_REQUEST)
+
+        secret = generate_totp_secret()
+        device, _ = MFATOTPDevice.objects.get_or_create(user=request.user, defaults={"secret": secret})
+        if serializer.validated_data.get("regenerate") or device.is_confirmed is False:
+            device.secret = secret
+            device.is_confirmed = False
+            device.confirmed_at = None
+            device.save(update_fields=["secret", "is_confirmed", "confirmed_at", "updated_at"])
+        account = _ensure_user_account(request.user)
+        otp_uri = build_totp_uri(
+            secret=device.secret,
+            account_name=account.email or request.user.username,
+            issuer=getattr(settings, "APP_NAME", "Website Builder"),
+        )
+        return Response(
+            {
+                "secret": device.secret,
+                "otpauth_url": otp_uri,
+                "mfa_enabled": bool(account.mfa_enabled),
+            }
+        )
+
+
+class AuthMFATOTPVerifyView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthMFATOTPVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        device = get_object_or_404(MFATOTPDevice, user=request.user)
+        if not verify_totp(device.secret, serializer.validated_data["code"]):
+            return Response({"detail": "Invalid TOTP code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        device.is_confirmed = True
+        device.confirmed_at = timezone.now()
+        device.last_used_at = timezone.now()
+        device.save(update_fields=["is_confirmed", "confirmed_at", "last_used_at", "updated_at"])
+
+        account = _ensure_user_account(request.user)
+        account.mfa_enabled = True
+        account.save(update_fields=["mfa_enabled", "updated_at"])
+        state, _ = UserSecurityState.objects.get_or_create(user=request.user)
+        state.last_mfa_at = timezone.now()
+        state.save(update_fields=["last_mfa_at", "updated_at"])
+
+        MFARecoveryCode.objects.filter(user=request.user, used_at__isnull=True).delete()
+        plain_codes = generate_recovery_codes()
+        MFARecoveryCode.objects.bulk_create(
+            [
+                MFARecoveryCode(
+                    user=request.user,
+                    code_hash=hash_recovery_code(code),
+                )
+                for code in plain_codes
+            ]
+        )
+        log_security_event(
+            "auth.mfa.enable",
+            request=request,
+            actor=request.user,
+            target_type="user",
+            target_id=str(request.user.pk),
+        )
+        return Response({"mfa_enabled": True, "recovery_codes": plain_codes})
+
+
+class AuthMFARecoveryCodesRegenerateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthMFABackupCodeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        device = getattr(request.user, "mfa_totp_device", None)
+        if device is None or not device.is_confirmed:
+            return Response({"detail": "MFA is not configured."}, status=status.HTTP_400_BAD_REQUEST)
+
+        totp_code = serializer.validated_data.get("totp_code") or ""
+        recovery_code = serializer.validated_data.get("recovery_code") or ""
+        if totp_code:
+            verified = verify_totp(device.secret, totp_code)
+        elif recovery_code:
+            verified = _consume_recovery_code(user=request.user, code=recovery_code)
+        else:
+            verified = False
+        if not verified:
+            return Response({"detail": "Invalid verification code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        MFARecoveryCode.objects.filter(user=request.user, used_at__isnull=True).delete()
+        plain_codes = generate_recovery_codes()
+        MFARecoveryCode.objects.bulk_create(
+            [MFARecoveryCode(user=request.user, code_hash=hash_recovery_code(code)) for code in plain_codes]
+        )
+        log_security_event(
+            "auth.mfa.recovery_codes.regenerate",
+            request=request,
+            actor=request.user,
+            target_type="user",
+            target_id=str(request.user.pk),
+        )
+        return Response({"recovery_codes": plain_codes})
+
+
+class AuthSessionListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def get(self, request):
+        current_session_id = request.session.get("active_user_session_id")
+        sessions = active_sessions_for_user(request.user)
+        return Response(
+            {
+                "results": [
+                    {
+                        "id": session.id,
+                        "auth_method": session.auth_method,
+                        "device_id": session.device_id,
+                        "device_name": session.device_name,
+                        "ip_address": session.ip_address,
+                        "user_agent": session.user_agent,
+                        "last_seen_at": session.last_seen_at,
+                        "created_at": session.created_at,
+                        "current": bool(current_session_id and int(current_session_id) == session.id),
+                    }
+                    for session in sessions
+                ]
+            }
+        )
+
+
+class AuthSessionRevokeView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthSessionRevokeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        session_id = serializer.validated_data.get("session_id")
+        device_id = (serializer.validated_data.get("device_id") or "").strip()
+        revoked = False
+        target_id = ""
+        if session_id:
+            target_id = str(session_id)
+            revoked = revoke_session(user=request.user, session_id=session_id)
+        elif device_id:
+            target_id = device_id
+            revoked = bool(
+                UserSession.objects.filter(
+                    user=request.user,
+                    device_id=device_id,
+                    revoked_at__isnull=True,
+                ).update(revoked_at=timezone.now(), updated_at=timezone.now())
+            )
+        log_security_event(
+            "auth.session.revoke",
+            request=request,
+            actor=request.user,
+            target_type="user_session",
+            target_id=target_id,
+            success=revoked,
+        )
+        return Response({"revoked": bool(revoked)})
+
+
+class AuthSessionRevokeOthersView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        current_session_id = request.session.get("active_user_session_id")
+        revoked_count = revoke_other_sessions(user=request.user, keep_session_id=current_session_id)
+        revoke_all_refresh_tokens(request.user)
+        log_security_event(
+            "auth.session.revoke_others",
+            request=request,
+            actor=request.user,
+            target_type="user",
+            target_id=str(request.user.pk),
+            metadata={"revoked_count": revoked_count},
+        )
+        return Response({"revoked_count": int(revoked_count)})
+
+
+class AuthSocialLoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def post(self, request):
+        serializer = AuthSocialLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        provider = serializer.validated_data["provider"]
+        adapter = social_provider_registry.get(provider)
+        if adapter is None:
+            return Response({"detail": f"Social provider '{provider}' is not configured."}, status=status.HTTP_501_NOT_IMPLEMENTED)
+        identity = adapter.verify(access_token=serializer.validated_data["access_token"])
+        email = (identity.email or "").strip().lower()
+        if not email:
+            return Response({"detail": "Social identity did not provide an email."}, status=status.HTTP_400_BAD_REQUEST)
+        user = User.objects.filter(email__iexact=email).first()
+        if user is None:
+            base = (email.split("@")[0] or provider).strip()
+            username = base
+            suffix = 2
+            while User.objects.filter(username=username).exists():
+                username = f"{base}{suffix}"
+                suffix += 1
+            user = User.objects.create_user(username=username, email=email, password=secrets.token_urlsafe(32))
+        account = _ensure_user_account(user)
+        if identity.display_name and not account.display_name:
+            account.display_name = identity.display_name[:160]
+        if identity.avatar_url and not account.avatar_url:
+            account.avatar_url = identity.avatar_url[:600]
+        if identity.email_verified and not account.email_verified_at:
+            account.email_verified_at = timezone.now()
+        account.save()
+
+        login(request, user)
+        start_user_session(request=request, user=user, auth_method=UserSession.AUTH_SESSION)
+        log_security_event(
+            "auth.social_login",
+            request=request,
+            actor=user,
+            target_type="user",
+            target_id=str(user.pk),
+            metadata={"provider": provider},
+        )
+        return Response({"authenticated": True, "has_users": True, "user": _auth_user_payload(user, request=request)})
+
+
+class AuthActivityTimelineView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = []
+
+    def get_throttles(self):
+        from .throttles import AuthSessionThrottle
+
+        return [AuthSessionThrottle()]
+
+    def get(self, request):
+        limit = min(max(int(request.query_params.get("limit", 100)), 1), 500)
+        events = (
+            SecurityAuditLog.objects.filter(
+                models.Q(actor=request.user)
+                | models.Q(target_type="user", target_id=str(request.user.pk))
+            )
+            .order_by("-created_at")[:limit]
+        )
+        return Response({"results": UserActivitySerializer(events, many=True).data})
+
+
 class SiteViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     serializer_class = SiteSerializer
+    site_write_permission = SitePermission.MANAGE
 
     def get_queryset(self):
         from .workspace_views import filter_sites_by_permission
@@ -841,6 +2161,70 @@ class SiteViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         site.refresh_from_db()
         payload = SiteSerializer(site, context={"request": request}).data
         return Response({"site": payload, **result})
+
+    @action(detail=True, methods=["get"], url_path="members")
+    def members(self, request, pk=None):
+        site = self.get_object()
+        if not self.check_site_manage_permission(site):
+            raise PermissionDenied("You don't have permission to manage this site.")
+        memberships = site.memberships.select_related("user", "granted_by").order_by("role", "user__username")
+        return Response(SiteMembershipSerializer(memberships, many=True, context={"request": request}).data)
+
+    @members.mapping.post
+    def upsert_member(self, request, pk=None):
+        site = self.get_object()
+        if not self.check_site_manage_permission(site):
+            raise PermissionDenied("You don't have permission to manage this site.")
+        serializer = SiteMembershipUpsertSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = get_object_or_404(User, pk=serializer.validated_data["user_id"])
+        membership, created = SiteMembership.objects.get_or_create(
+            site=site,
+            user=user,
+            defaults={
+                "role": serializer.validated_data["role"],
+                "status": serializer.validated_data.get("status", SiteMembership.STATUS_ACTIVE),
+                "granted_by": request.user,
+                "accepted_at": timezone.now(),
+            },
+        )
+        if not created:
+            membership.role = serializer.validated_data["role"]
+            if serializer.validated_data.get("status"):
+                membership.status = serializer.validated_data["status"]
+            membership.granted_by = request.user
+            if membership.accepted_at is None:
+                membership.accepted_at = timezone.now()
+            membership.save(update_fields=["role", "status", "granted_by", "accepted_at", "updated_at"])
+        log_security_event(
+            "site.membership.upsert",
+            request=request,
+            actor=request.user,
+            target_type="site_membership",
+            target_id=str(membership.pk),
+            metadata={"site_id": site.pk, "created": created},
+        )
+        return Response(
+            SiteMembershipSerializer(membership, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["delete"], url_path=r"members/(?P<membership_id>[^/.]+)")
+    def remove_member(self, request, pk=None, membership_id=None):
+        site = self.get_object()
+        if not self.check_site_manage_permission(site):
+            raise PermissionDenied("You don't have permission to manage this site.")
+        membership = get_object_or_404(SiteMembership, pk=membership_id, site=site)
+        membership.delete()
+        log_security_event(
+            "site.membership.delete",
+            request=request,
+            actor=request.user,
+            target_type="site_membership",
+            target_id=str(membership_id),
+            metadata={"site_id": site.pk},
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class SiteLocaleViewSet(SitePermissionMixin, viewsets.ModelViewSet):
@@ -895,6 +2279,7 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     def perform_update(self, serializer):
         page = super().perform_update(serializer)
         queue_search_index("page", page.id)
+        trigger_webhooks(page.site, "page.updated", {"page_id": page.id, "title": page.title, "path": page.path})
 
     @action(detail=True, methods=["post"])
     def save_builder(self, request, pk=None):
@@ -936,6 +2321,15 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         page.published_at = timezone.now()
         page.save()
         create_revision(page, "Published snapshot")
+        create_publish_snapshot(
+            site=page.site,
+            target_type=PublishSnapshot.TARGET_PAGE,
+            target_id=page.id,
+            instance=page,
+            actor=request.user,
+            revision_label="Published snapshot",
+            metadata={"source": "builder.page.publish"},
+        )
         queue_search_index("page", page.id)
         trigger_webhooks(page.site, "page.published", {"page_id": page.id, "title": page.title, "path": page.path})
         return Response(PageSerializer(page, context={"request": request}).data)
@@ -962,6 +2356,38 @@ class PageViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         schedule_content_publish("page", page.id, scheduled_time)
 
         return Response(PageSerializer(page, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"])
+    def validate_layout(self, request, pk=None):
+        page = self.get_object()
+        payload = request.data if isinstance(request.data, dict) else {}
+        try:
+            normalized = normalize_page_content(
+                title=payload.get("title") or page.title,
+                slug=payload.get("slug") or page.slug,
+                path=payload.get("path") or page.path,
+                is_homepage=bool(payload.get("is_homepage", page.is_homepage)),
+                status=payload.get("status") or page.status,
+                locale_code="",
+                builder_data=payload.get("builder_data", page.builder_data),
+                seo=payload.get("seo", page.seo),
+                page_settings=payload.get("page_settings", page.page_settings),
+                html=payload.get("html", page.html),
+                css=payload.get("css", page.css),
+                js=payload.get("js", page.js),
+                schema_version=payload.get("builder_schema_version", page.builder_schema_version),
+                strict=True,
+            )
+        except DjangoValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}
+            return Response({"valid": False, "errors": detail}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "valid": True,
+                "builder_schema_version": normalized["schema_version"],
+                "warnings": [],
+            }
+        )
 
 
 class PageTranslationViewSet(SitePermissionMixin, viewsets.ModelViewSet):
@@ -1378,6 +2804,7 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         kind = self.request.query_params.get("kind")
         search = self.request.query_params.get("search")
         unfoldered = self.request.query_params.get("unfoldered")
+        include_deleted = self.request.query_params.get("include_deleted")
         if site_id:
             queryset = queryset.filter(site_id=site_id)
         if folder_id:
@@ -1386,19 +2813,111 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(folder__isnull=True)
         if kind:
             queryset = queryset.filter(kind=kind)
+        if include_deleted not in {"1", "true", "yes"}:
+            queryset = queryset.filter(deleted_at__isnull=True)
         if search:
             queryset = queryset.filter(
-                models.Q(title__icontains=search) | models.Q(alt_text__icontains=search)
+                models.Q(title__icontains=search)
+                | models.Q(alt_text__icontains=search)
+                | models.Q(caption__icontains=search)
+                | models.Q(tags__icontains=search)
             )
         return self.filter_by_site_permission(queryset)
 
+    def _extract_media_metadata(self, uploaded_file) -> dict:
+        metadata: dict[str, object] = {}
+        if uploaded_file is None:
+            return metadata
+
+        content_type = getattr(uploaded_file, "content_type", "") or ""
+        if content_type:
+            metadata["content_type"] = content_type
+
+        if hasattr(uploaded_file, "size"):
+            metadata["size"] = int(uploaded_file.size or 0)
+
+        head = b""
+        current_pos = None
+        if hasattr(uploaded_file, "tell"):
+            try:
+                current_pos = uploaded_file.tell()
+            except Exception:
+                current_pos = None
+        try:
+            if hasattr(uploaded_file, "seek"):
+                uploaded_file.seek(0)
+            head = uploaded_file.read(1024 * 1024) or b""
+            if isinstance(head, str):
+                head = head.encode("utf-8", errors="ignore")
+        except Exception:
+            head = b""
+        finally:
+            if hasattr(uploaded_file, "seek"):
+                try:
+                    if current_pos is not None:
+                        uploaded_file.seek(current_pos)
+                    else:
+                        uploaded_file.seek(0)
+                except Exception:
+                    pass
+
+        if head:
+            metadata["content_signature"] = hashlib.sha256(head).hexdigest()
+
+        try:
+            from PIL import Image
+
+            with Image.open(uploaded_file) as image:
+                metadata["image_width"] = int(image.width)
+                metadata["image_height"] = int(image.height)
+                metadata["image_format"] = str(image.format or "").lower()
+        except Exception:
+            pass
+        return metadata
+
+    def _save_security_metadata(self, asset: MediaAsset, uploaded_file=None):
+        source_file = uploaded_file or asset.file
+        if not source_file:
+            return
+        extracted = self._extract_media_metadata(source_file)
+        dirty_fields: list[str] = []
+
+        content_type = str(extracted.get("content_type") or "")
+        if content_type and asset.mime_type != content_type:
+            asset.mime_type = content_type
+            dirty_fields.append("mime_type")
+
+        file_size = int(extracted.get("size") or 0)
+        if file_size and asset.file_size != file_size:
+            asset.file_size = file_size
+            dirty_fields.append("file_size")
+
+        signature = str(extracted.get("content_signature") or "")
+        if signature and asset.content_signature != signature:
+            asset.content_signature = signature
+            dirty_fields.append("content_signature")
+
+        metadata = asset.metadata if isinstance(asset.metadata, dict) else {}
+        merged_metadata = {**metadata, **{k: v for k, v in extracted.items() if k not in {"content_type", "size", "content_signature"}}}
+        if merged_metadata != metadata:
+            asset.metadata = merged_metadata
+            dirty_fields.append("metadata")
+
+        if dirty_fields:
+            dirty_fields.append("updated_at")
+            asset.save(update_fields=dirty_fields)
+
     def perform_create(self, serializer):
         asset = super().perform_create(serializer)
+        self._save_security_metadata(asset, uploaded_file=self.request.FILES.get("file"))
         queue_search_index("media", asset.id)
+        trigger_webhooks(asset.site, "media.asset.created", {"asset_id": asset.id, "title": asset.title})
 
     def perform_update(self, serializer):
         asset = super().perform_update(serializer)
+        self._save_security_metadata(asset, uploaded_file=self.request.FILES.get("file"))
         queue_search_index("media", asset.id)
+        trigger_webhooks(asset.site, "media.asset.updated", {"asset_id": asset.id, "title": asset.title})
 
     def create(self, request, *args, **kwargs):
         """Override create to add file validation."""
@@ -1411,11 +2930,27 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
                 return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
             # Set kind in request data if not provided
             if "kind" not in request.data:
-                request.data._mutable = True
-                request.data["kind"] = kind
-                request.data._mutable = False
+                if hasattr(request.data, "_mutable"):
+                    was_mutable = request.data._mutable
+                    request.data._mutable = True
+                    request.data["kind"] = kind
+                    request.data._mutable = was_mutable
+                else:
+                    request.data["kind"] = kind
 
         return super().create(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        asset = self.get_object()
+        if asset.deleted_at is None:
+            asset.deleted_at = timezone.now()
+            if request.user.is_authenticated:
+                asset.deleted_by = request.user
+            asset.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+            queue_search_index("media", asset.id, operation="delete")
+            trigger_webhooks(asset.site, "media.asset.deleted", {"asset_id": asset.id, "title": asset.title})
+        serializer = self.get_serializer(asset)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
     def bulk_delete(self, request):
@@ -1434,13 +2969,62 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        now = timezone.now()
+        deleted_count = 0
         for asset in assets:
-            try:
-                asset.file.delete(save=False)
-            except Exception:
-                pass
-        count, _ = assets.delete()
-        return Response({"deleted": count})
+            if asset.deleted_at is None:
+                asset.deleted_at = now
+                if request.user.is_authenticated:
+                    asset.deleted_by = request.user
+                asset.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+                queue_search_index("media", asset.id, operation="delete")
+                deleted_count += 1
+        return Response({"deleted": deleted_count})
+
+    @action(detail=True, methods=["post"])
+    def restore(self, request, pk=None):
+        asset = self.get_object()
+        if asset.deleted_at is None:
+            return Response(MediaAssetSerializer(asset, context={"request": request}).data)
+        asset.deleted_at = None
+        asset.deleted_by = None
+        asset.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+        queue_search_index("media", asset.id)
+        trigger_webhooks(asset.site, "media.asset.restored", {"asset_id": asset.id, "title": asset.title})
+        return Response(MediaAssetSerializer(asset, context={"request": request}).data)
+
+    @action(detail=False, methods=["post"])
+    def bulk_restore(self, request):
+        ids = request.data.get("ids", [])
+        if not ids:
+            return Response({"detail": "Provide 'ids' list."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            normalized_ids = [int(item) for item in ids]
+        except (TypeError, ValueError):
+            return Response({"detail": "All ids must be integers."}, status=status.HTTP_400_BAD_REQUEST)
+
+        assets = self.filter_by_site_permission(MediaAsset.objects.filter(pk__in=normalized_ids))
+        restored = 0
+        for asset in assets:
+            if asset.deleted_at is not None:
+                asset.deleted_at = None
+                asset.deleted_by = None
+                asset.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+                queue_search_index("media", asset.id)
+                restored += 1
+        return Response({"restored": restored})
+
+    @action(detail=True, methods=["delete"])
+    def hard_delete(self, request, pk=None):
+        asset = self.get_object()
+        try:
+            asset.file.delete(save=False)
+        except Exception:
+            pass
+        asset_id = asset.id
+        asset.delete()
+        queue_search_index("media", asset_id, operation="delete")
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=["post"])
     def move_to_folder(self, request):
@@ -1473,6 +3057,52 @@ class MediaAssetViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         updated = assets.update(folder=folder)
         return Response({"moved": updated})
 
+    @action(detail=True, methods=["get"])
+    def usage_references(self, request, pk=None):
+        asset = self.get_object()
+        references = asset.usage_references.order_by("-updated_at")
+        serializer = AssetUsageReferenceSerializer(references, many=True, context={"request": request})
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def upsert_usage_reference(self, request, pk=None):
+        asset = self.get_object()
+        payload = {
+            "site": asset.site_id,
+            "asset": asset.id,
+            "entity_type": request.data.get("entity_type"),
+            "entity_id": request.data.get("entity_id"),
+            "field_name": request.data.get("field_name") or "",
+            "metadata": request.data.get("metadata") or {},
+        }
+        existing = AssetUsageReference.objects.filter(
+            asset=asset,
+            entity_type=payload["entity_type"],
+            entity_id=payload["entity_id"],
+            field_name=payload["field_name"],
+        ).first()
+        serializer = AssetUsageReferenceSerializer(existing, data=payload, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        reference = serializer.save()
+        return Response(AssetUsageReferenceSerializer(reference, context={"request": request}).data)
+
+
+class AssetUsageReferenceViewSet(SitePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = AssetUsageReferenceSerializer
+
+    def get_queryset(self):
+        queryset = AssetUsageReference.objects.select_related("site", "asset").order_by("-updated_at")
+        site_id = self.request.query_params.get("site")
+        asset_id = self.request.query_params.get("asset")
+        entity_type = self.request.query_params.get("entity_type")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if asset_id:
+            queryset = queryset.filter(asset_id=asset_id)
+        if entity_type:
+            queryset = queryset.filter(entity_type=entity_type)
+        return self.filter_by_site_permission(queryset)
+
 
 class PostCategoryViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     serializer_class = PostCategorySerializer
@@ -1495,6 +3125,23 @@ class PostTagViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         site_id = self.request.query_params.get("site")
         if site_id:
             queryset = queryset.filter(site_id=site_id)
+        return self.filter_by_site_permission(queryset)
+
+
+class BlogAuthorViewSet(SitePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = BlogAuthorSerializer
+
+    def get_queryset(self):
+        ensure_seed_data()
+        queryset = BlogAuthor.objects.select_related("site", "user").order_by("display_name")
+        site_id = self.request.query_params.get("site")
+        active = self.request.query_params.get("active")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if active in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_active=True)
+        elif active in {"0", "false", "no"}:
+            queryset = queryset.filter(is_active=False)
         return self.filter_by_site_permission(queryset)
 
 
@@ -1583,8 +3230,8 @@ class PostViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         ensure_seed_data()
         queryset = (
-            Post.objects.select_related("site", "featured_media")
-            .prefetch_related("categories", "tags", "comments")
+            Post.objects.select_related("site", "featured_media", "primary_author")
+            .prefetch_related("categories", "tags", "comments", "related_posts")
             .order_by("-published_at", "-updated_at")
         )
         site_id = self.request.query_params.get("site")
@@ -1602,22 +3249,48 @@ class PostViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     def perform_update(self, serializer):
         post = super().perform_update(serializer)
         queue_search_index("post", post.id)
+        trigger_webhooks(post.site, "post.updated", {"post_id": post.id, "title": post.title, "slug": post.slug})
 
     @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):
         post = self.get_object()
         post.status = Post.STATUS_PUBLISHED
         post.published_at = timezone.now()
-        post.save(update_fields=["status", "published_at", "updated_at"])
+        post.scheduled_at = None
+        post.save(update_fields=["status", "published_at", "scheduled_at", "updated_at"])
+        create_publish_snapshot(
+            site=post.site,
+            target_type=PublishSnapshot.TARGET_POST,
+            target_id=post.id,
+            instance=post,
+            actor=request.user,
+            revision_label="Published snapshot",
+            metadata={"source": "builder.post.publish"},
+        )
         queue_search_index("post", post.id)
         trigger_webhooks(post.site, "post.published", {"post_id": post.id, "title": post.title, "slug": post.slug})
+        trigger_webhooks(
+            post.site,
+            "site.published",
+            {"site_id": post.site_id, "source": "post", "post_id": post.id, "slug": post.slug},
+        )
         return Response(PostSerializer(post, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
     def unpublish(self, request, pk=None):
         post = self.get_object()
         post.status = Post.STATUS_DRAFT
-        post.save(update_fields=["status", "updated_at"])
+        post.scheduled_at = None
+        post.save(update_fields=["status", "scheduled_at", "updated_at"])
+        create_publish_snapshot(
+            site=post.site,
+            target_type=PublishSnapshot.TARGET_POST,
+            target_id=post.id,
+            instance=post,
+            actor=request.user,
+            revision_label="Unpublished snapshot",
+            metadata={"source": "builder.post.unpublish"},
+        )
         queue_search_index("post", post.id)
         return Response(PostSerializer(post, context={"request": request}).data)
 
@@ -1636,11 +3309,28 @@ class PostViewSet(SitePermissionMixin, viewsets.ModelViewSet):
             return Response({"detail": "Invalid date format"}, status=status.HTTP_400_BAD_REQUEST)
 
         post.scheduled_at = scheduled_time
-        post.save(update_fields=["scheduled_at", "updated_at"])
+        post.status = Post.STATUS_SCHEDULED
+        post.save(update_fields=["scheduled_at", "status", "updated_at"])
 
         from .jobs import schedule_content_publish
         schedule_content_publish("post", post.id, scheduled_time)
 
+        return Response(PostSerializer(post, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"])
+    def submit_for_review(self, request, pk=None):
+        post = self.get_object()
+        post.status = Post.STATUS_IN_REVIEW
+        post.save(update_fields=["status", "updated_at"])
+        trigger_webhooks(post.site, "post.review_requested", {"post_id": post.id, "title": post.title, "slug": post.slug})
+        return Response(PostSerializer(post, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        post = self.get_object()
+        post.status = Post.STATUS_ARCHIVED
+        post.save(update_fields=["status", "updated_at"])
+        trigger_webhooks(post.site, "post.archived", {"post_id": post.id, "title": post.title, "slug": post.slug})
         return Response(PostSerializer(post, context={"request": request}).data)
 
 
@@ -1679,6 +3369,7 @@ class ProductViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     def perform_update(self, serializer):
         product = super().perform_update(serializer)
         queue_search_index("product", product.id)
+        trigger_webhooks(product.site, "product.updated", {"product_id": product.id, "title": product.title, "slug": product.slug})
 
     @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):
@@ -1686,7 +3377,26 @@ class ProductViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         product.status = Product.STATUS_PUBLISHED
         product.published_at = timezone.now()
         product.save(update_fields=["status", "published_at", "updated_at"])
+        create_publish_snapshot(
+            site=product.site,
+            target_type=PublishSnapshot.TARGET_PRODUCT,
+            target_id=product.id,
+            instance=product,
+            actor=request.user,
+            revision_label="Published snapshot",
+            metadata={"source": "builder.product.publish"},
+        )
         queue_search_index("product", product.id)
+        trigger_webhooks(
+            product.site,
+            "product.published",
+            {"product_id": product.id, "title": product.title, "slug": product.slug},
+        )
+        trigger_webhooks(
+            product.site,
+            "site.published",
+            {"site_id": product.site_id, "source": "product", "product_id": product.id, "slug": product.slug},
+        )
         return Response(ProductSerializer(product, context={"request": request}).data)
 
     @action(detail=True, methods=["post"])
@@ -1694,6 +3404,15 @@ class ProductViewSet(SitePermissionMixin, viewsets.ModelViewSet):
         product = self.get_object()
         product.status = Product.STATUS_DRAFT
         product.save(update_fields=["status", "updated_at"])
+        create_publish_snapshot(
+            site=product.site,
+            target_type=PublishSnapshot.TARGET_PRODUCT,
+            target_id=product.id,
+            instance=product,
+            actor=request.user,
+            revision_label="Unpublished snapshot",
+            metadata={"source": "builder.product.unpublish"},
+        )
         queue_search_index("product", product.id)
         return Response(ProductSerializer(product, context={"request": request}).data)
 
@@ -1733,7 +3452,53 @@ class CommentViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         comment = self.get_object()
         comment.is_approved = True
-        comment.save(update_fields=["is_approved", "updated_at"])
+        comment.moderation_state = Comment.MODERATION_APPROVED
+        comment.save(update_fields=["is_approved", "moderation_state", "updated_at"])
+        return Response(CommentSerializer(comment, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        comment = self.get_object()
+        comment.is_approved = False
+        comment.moderation_state = Comment.MODERATION_REJECTED
+        comment.moderation_notes = (request.data.get("reason") or comment.moderation_notes or "")[:1000]
+        comment.save(update_fields=["is_approved", "moderation_state", "moderation_notes", "updated_at"])
+        return Response(CommentSerializer(comment, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"])
+    def mark_spam(self, request, pk=None):
+        comment = self.get_object()
+        comment.is_approved = False
+        comment.moderation_state = Comment.MODERATION_SPAM
+        comment.flagged_at = timezone.now()
+        score = request.data.get("spam_score")
+        provider = request.data.get("spam_provider")
+        notes = request.data.get("reason")
+        try:
+            if score is not None:
+                comment.spam_score = float(score)
+        except (TypeError, ValueError):
+            pass
+        if provider is not None:
+            comment.spam_provider = str(provider)[:80]
+        if notes:
+            comment.moderation_notes = str(notes)[:1000]
+        comment.save(
+            update_fields=[
+                "is_approved",
+                "moderation_state",
+                "flagged_at",
+                "spam_score",
+                "spam_provider",
+                "moderation_notes",
+                "updated_at",
+            ]
+        )
+        trigger_webhooks(
+            comment.post.site,
+            "comment.spam_flagged",
+            {"post_id": comment.post_id, "comment_id": comment.id, "spam_score": comment.spam_score},
+        )
         return Response(CommentSerializer(comment, context={"request": request}).data)
 
 
@@ -1843,7 +3608,7 @@ class PublicFormSubmissionView(APIView):
             site=site,
             page=page,
             form_name=serializer.validated_data["form_name"],
-            payload=serializer.validated_data["payload"],
+            payload=sanitize_json_payload(serializer.validated_data["payload"]),
         )
         record_conversion_from_assignments(
             request,
@@ -1873,17 +3638,37 @@ class PublicCommentSubmissionView(APIView):
 
         site = get_object_or_404(Site, slug=serializer.validated_data["site_slug"])
         post = get_object_or_404(site.posts.all(), slug=serializer.validated_data["post_slug"])
-        comment = Comment.objects.create(
-            post=post,
-            author_name=serializer.validated_data["author_name"],
+        spam_result = evaluate_comment_spam(
             author_email=serializer.validated_data["author_email"],
             body=serializer.validated_data["body"],
-            is_approved=False,
+        )
+        comment = Comment.objects.create(
+            post=post,
+            author_name=sanitize_text(serializer.validated_data["author_name"], max_length=140),
+            author_email=serializer.validated_data["author_email"],
+            body=sanitize_text(serializer.validated_data["body"], max_length=5000),
+            is_approved=not spam_result.is_spam,
+            moderation_state=Comment.MODERATION_SPAM if spam_result.is_spam else Comment.MODERATION_PENDING,
+            spam_score=spam_result.score,
+            spam_provider=spam_result.provider,
+            flagged_at=timezone.now() if spam_result.is_spam else None,
+        )
+        trigger_webhooks(
+            post.site,
+            "comment.submitted",
+            {
+                "comment_id": comment.id,
+                "post_id": post.id,
+                "status": comment.moderation_state,
+                "spam_score": comment.spam_score,
+                "spam_provider": comment.spam_provider,
+            },
         )
         return Response(
             {
                 "id": comment.id,
                 "detail": "Comment received and queued for moderation.",
+                "status": comment.moderation_state,
             },
             status=status.HTTP_201_CREATED,
         )
@@ -2798,6 +4583,292 @@ class BlockTemplateViewSet(viewsets.ModelViewSet):
         return Response(BlockTemplateSerializer(template, context={"request": request}).data)
 
 
+class ReusableSectionViewSet(SitePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = ReusableSectionSerializer
+
+    def get_queryset(self):
+        queryset = ReusableSection.objects.select_related("site").order_by("name")
+        site_id = self.request.query_params.get("site")
+        section_status = self.request.query_params.get("status")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if section_status:
+            queryset = queryset.filter(status=section_status)
+        return self.filter_by_site_permission(queryset)
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        section = self.get_object()
+        section.status = ReusableSection.STATUS_PUBLISHED
+        section.published_at = timezone.now()
+        section.save(update_fields=["status", "published_at", "updated_at"])
+        trigger_webhooks(
+            section.site,
+            "section.published",
+            {"section_id": section.id, "slug": section.slug, "name": section.name},
+        )
+        return Response(self.get_serializer(section).data)
+
+    @action(detail=True, methods=["post"])
+    def unpublish(self, request, pk=None):
+        section = self.get_object()
+        section.status = ReusableSection.STATUS_DRAFT
+        section.save(update_fields=["status", "updated_at"])
+        trigger_webhooks(
+            section.site,
+            "section.unpublished",
+            {"section_id": section.id, "slug": section.slug, "name": section.name},
+        )
+        return Response(self.get_serializer(section).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        section = self.get_object()
+        section.status = ReusableSection.STATUS_ARCHIVED
+        section.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(section).data)
+
+    @action(detail=True, methods=["post"])
+    def validate_layout(self, request, pk=None):
+        section = self.get_object()
+        schema = section.schema if isinstance(section.schema, dict) else {}
+        layout = schema.get("layout")
+        if not isinstance(layout, dict):
+            return Response({"valid": False, "errors": ["schema.layout must be an object."]}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(layout.get("type"), str) or not layout.get("type"):
+            return Response({"valid": False, "errors": ["schema.layout.type is required."]}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"valid": True})
+
+
+class ThemeTemplateViewSet(SitePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = ThemeTemplateSerializer
+
+    def get_queryset(self):
+        queryset = ThemeTemplate.objects.select_related("site").order_by("-is_global", "name")
+        site_id = self.request.query_params.get("site")
+        global_only = self.request.query_params.get("global")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if global_only in {"1", "true", "yes"}:
+            queryset = queryset.filter(is_global=True)
+        scoped_queryset = self.filter_by_site_permission(queryset.filter(is_global=False))
+        if self.request.user.is_superuser:
+            return queryset
+        return (scoped_queryset | queryset.filter(is_global=True)).distinct()
+
+    def _check_template_permission(self, template: ThemeTemplate):
+        if template.is_global and not self.request.user.is_superuser:
+            raise PermissionDenied("Only super admins can edit global themes.")
+        if template.site_id:
+            self.check_site_edit_permission(template.site)
+
+    def perform_create(self, serializer):
+        is_global = bool(serializer.validated_data.get("is_global", False))
+        site = serializer.validated_data.get("site")
+        if is_global and not self.request.user.is_superuser:
+            raise PermissionDenied("Only super admins can create global themes.")
+        if not is_global and site is None:
+            raise ValidationError({"site": "Site is required for non-global themes."})
+        if site:
+            self.check_site_edit_permission(site)
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._check_template_permission(serializer.instance)
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._check_template_permission(instance)
+        super().perform_destroy(instance)
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        template = self.get_object()
+        self._check_template_permission(template)
+        template.status = ThemeTemplate.STATUS_PUBLISHED
+        template.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(template).data)
+
+
+class SiteShellViewSet(SitePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = SiteShellSerializer
+
+    def get_queryset(self):
+        queryset = SiteShell.objects.select_related("site", "header_menu", "footer_menu").order_by("site__name")
+        site_id = self.request.query_params.get("site")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        return self.filter_by_site_permission(queryset)
+
+    def create(self, request, *args, **kwargs):
+        site = self.get_site_from_request(key="site", source="data", require_edit=True)
+        shell, _ = SiteShell.objects.get_or_create(site=site)
+        serializer = self.get_serializer(shell, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class PublishSnapshotViewSet(SitePermissionMixin, viewsets.ReadOnlyModelViewSet):
+    serializer_class = PublishSnapshotSerializer
+
+    def get_queryset(self):
+        queryset = PublishSnapshot.objects.select_related("site", "actor").order_by("-created_at")
+        site_id = self.request.query_params.get("site")
+        target_type = self.request.query_params.get("target_type")
+        target_id = self.request.query_params.get("target_id")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if target_type:
+            queryset = queryset.filter(target_type=target_type)
+        if target_id:
+            queryset = queryset.filter(target_id=target_id)
+        return self.filter_by_site_permission(queryset)
+
+    @action(detail=True, methods=["post"])
+    def restore(self, request, pk=None):
+        snapshot = self.get_object()
+        self.check_site_edit_permission(snapshot.site)
+        payload = snapshot.snapshot if isinstance(snapshot.snapshot, dict) else {}
+
+        if snapshot.target_type == PublishSnapshot.TARGET_PAGE:
+            page = get_object_or_404(Page.objects.select_related("site"), pk=snapshot.target_id, site=snapshot.site)
+            for field in ("title", "slug", "path", "seo", "page_settings", "builder_data", "html", "css", "js"):
+                if field in payload:
+                    setattr(page, field, payload.get(field))
+            page.status = Page.STATUS_DRAFT
+            page.save()
+            create_revision(page, f"Restored from snapshot {snapshot.id}")
+            trigger_webhooks(page.site, "page.restored", {"page_id": page.id, "snapshot_id": snapshot.id})
+            return Response(PageSerializer(page, context={"request": request}).data)
+
+        if snapshot.target_type == PublishSnapshot.TARGET_POST:
+            post = get_object_or_404(Post.objects.select_related("site"), pk=snapshot.target_id, site=snapshot.site)
+            for field in ("title", "slug", "excerpt", "body_html", "seo"):
+                if field in payload:
+                    setattr(post, field, payload.get(field))
+            post.status = Post.STATUS_DRAFT
+            post.save(update_fields=["title", "slug", "excerpt", "body_html", "seo", "status", "updated_at"])
+            trigger_webhooks(post.site, "post.restored", {"post_id": post.id, "snapshot_id": snapshot.id})
+            return Response(PostSerializer(post, context={"request": request}).data)
+
+        if snapshot.target_type == PublishSnapshot.TARGET_PRODUCT:
+            product = get_object_or_404(Product.objects.select_related("site"), pk=snapshot.target_id, site=snapshot.site)
+            for field in ("title", "slug", "excerpt", "description_html", "seo", "settings"):
+                if field in payload:
+                    setattr(product, field, payload.get(field))
+            product.status = Product.STATUS_DRAFT
+            product.save(update_fields=["title", "slug", "excerpt", "description_html", "seo", "settings", "status", "updated_at"])
+            trigger_webhooks(product.site, "product.restored", {"product_id": product.id, "snapshot_id": snapshot.id})
+            return Response(ProductSerializer(product, context={"request": request}).data)
+
+        return Response({"detail": "Unsupported snapshot target."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PreviewTokenViewSet(SitePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = PreviewTokenSerializer
+
+    def get_queryset(self):
+        queryset = PreviewToken.objects.select_related("site", "page", "locale", "created_by").order_by("-created_at")
+        site_id = self.request.query_params.get("site")
+        page_id = self.request.query_params.get("page")
+        include_revoked = self.request.query_params.get("include_revoked")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if page_id:
+            queryset = queryset.filter(page_id=page_id)
+        if include_revoked not in {"1", "true", "yes"}:
+            queryset = queryset.filter(revoked_at__isnull=True)
+        return self.filter_by_site_permission(queryset)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        site = serializer.validated_data["site"]
+        self.check_site_edit_permission(site)
+        expires_at = serializer.validated_data.get("expires_at")
+        if expires_at is None:
+            expires_at = timezone.now() + timedelta(hours=2)
+        raw_token = secrets.token_urlsafe(48)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        preview_token = serializer.save(
+            token_hash=token_hash,
+            expires_at=expires_at,
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        data = self.get_serializer(preview_token).data
+        data["token"] = raw_token
+        return Response(data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def revoke(self, request, pk=None):
+        token = self.get_object()
+        if token.revoked_at is None:
+            token.revoked_at = timezone.now()
+            token.save(update_fields=["revoked_at", "updated_at"])
+        return Response(self.get_serializer(token).data)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        permission_classes=[permissions.AllowAny],
+        authentication_classes=[],
+        url_path="resolve",
+    )
+    def resolve(self, request):
+        raw_token = (request.data.get("token") or "").strip()
+        if not raw_token:
+            return Response({"detail": "token is required."}, status=status.HTTP_400_BAD_REQUEST)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        token = (
+            PreviewToken.objects.select_related("site", "page", "locale")
+            .filter(
+                token_hash=token_hash,
+                revoked_at__isnull=True,
+                expires_at__gt=timezone.now(),
+            )
+            .first()
+        )
+        if token is None:
+            return Response({"detail": "Preview token is invalid or expired."}, status=status.HTTP_404_NOT_FOUND)
+        token.used_at = timezone.now()
+        token.save(update_fields=["used_at", "updated_at"])
+
+        page = token.page
+        if page is None:
+            return Response({"detail": "Preview token has no page target."}, status=status.HTTP_400_BAD_REQUEST)
+        translation_payload = None
+        if token.locale_id:
+            translation = (
+                page.translations.select_related("locale")
+                .filter(locale_id=token.locale_id)
+                .first()
+            )
+            if translation:
+                translation_payload = {
+                    "id": translation.id,
+                    "locale": translation.locale.code,
+                    "title": translation.title,
+                    "path": translation.path,
+                    "builder_schema_version": translation.builder_schema_version,
+                    "builder_data": translation.builder_data,
+                    "seo": translation.seo,
+                    "page_settings": translation.page_settings,
+                    "html": translation.html,
+                    "css": translation.css,
+                    "js": translation.js,
+                    "status": translation.status,
+                }
+        return Response(
+            {
+                "site": {"id": page.site_id, "slug": page.site.slug},
+                "page": PageSerializer(page, context={"request": request}).data,
+                "translation": translation_payload,
+                "preview": {"expires_at": token.expires_at, "used_at": token.used_at},
+            }
+        )
+
+
 class URLRedirectViewSet(SitePermissionMixin, viewsets.ModelViewSet):
     serializer_class = URLRedirectSerializer
 
@@ -3548,12 +5619,9 @@ class PaymentIntentView(APIView):
             PaymentConfigurationError,
         )
 
-        order_id = request.data.get("order_id")
-        if not order_id:
-            return Response(
-                {"detail": "order_id is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        payload = PaymentIntentSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        order_id = payload.validated_data["order_id"]
 
         try:
             order = Order.objects.get(pk=order_id)
@@ -3590,6 +5658,14 @@ class PaymentIntentView(APIView):
 
         try:
             intent = service.create_checkout_session(order)
+            log_security_event(
+                "payment.intent.create",
+                request=request,
+                actor=request.user if request.user.is_authenticated else None,
+                target_type="order",
+                target_id=str(order.pk),
+                metadata={"amount": intent.amount, "currency": intent.currency},
+            )
             return Response({
                 "client_secret": intent.client_secret,
                 "payment_intent_id": intent.intent_id,
@@ -3717,6 +5793,14 @@ class RefundOrderView(APIView):
         try:
             result = service.refund_order(order)
             if result.success:
+                log_security_event(
+                    "payment.refund.success",
+                    request=request,
+                    actor=request.user if request.user.is_authenticated else None,
+                    target_type="order",
+                    target_id=str(order.pk),
+                    metadata={"refund_id": result.refund_id, "amount": result.amount},
+                )
                 return Response({
                     "success": True,
                     "refund_id": result.refund_id,
@@ -3725,11 +5809,29 @@ class RefundOrderView(APIView):
                     "payment_status": order.payment_status,
                 })
             else:
+                log_security_event(
+                    "payment.refund.failed",
+                    request=request,
+                    actor=request.user if request.user.is_authenticated else None,
+                    target_type="order",
+                    target_id=str(order.pk),
+                    success=False,
+                    metadata={"error": result.error_message},
+                )
                 return Response(
                     {"detail": result.error_message, "success": False},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
         except PaymentError as e:
+            log_security_event(
+                "payment.refund.failed",
+                request=request,
+                actor=request.user if request.user.is_authenticated else None,
+                target_type="order",
+                target_id=str(order.pk),
+                success=False,
+                metadata={"error_code": e.code},
+            )
             return Response(
                 {"detail": str(e), "code": e.code},
                 status=status.HTTP_400_BAD_REQUEST,

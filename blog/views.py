@@ -13,6 +13,7 @@ from blog.models import Post
 from blog.serializers import PublicRuntimePostSerializer
 from cms.services import public_site_capabilities
 from builder.views import (
+    BlogAuthorViewSet as BuilderBlogAuthorViewSet,
     CommentViewSet as BuilderCommentViewSet,
     PostCategoryViewSet as BuilderPostCategoryViewSet,
     PostTagViewSet as BuilderPostTagViewSet,
@@ -22,12 +23,14 @@ from builder.views import (
     public_blog_index,
     public_blog_post,
 )
+from django.utils.cache import patch_cache_control
 from core.views import PublicRuntimeSiteMixin
 
 
 PostViewSet = BuilderPostViewSet
 PostCategoryViewSet = BuilderPostCategoryViewSet
 PostTagViewSet = BuilderPostTagViewSet
+BlogAuthorViewSet = BuilderBlogAuthorViewSet
 CommentViewSet = BuilderCommentViewSet
 
 
@@ -45,8 +48,8 @@ class PublicRuntimeBlogPostsView(PublicRuntimeSiteMixin, APIView):
 
         now = timezone.now()
         queryset = (
-            site.posts.select_related("featured_media")
-            .prefetch_related("categories", "tags")
+            site.posts.select_related("featured_media", "primary_author")
+            .prefetch_related("categories", "tags", "related_posts")
             .filter(status=Post.STATUS_PUBLISHED)
             .filter(Q(published_at__isnull=True) | Q(published_at__lte=now))
             .order_by("-published_at", "-updated_at")
@@ -68,13 +71,15 @@ class PublicRuntimeBlogPostsView(PublicRuntimeSiteMixin, APIView):
             limit = 20
         posts = list(queryset[:limit])
         serializer = PublicRuntimePostSerializer(posts, many=True, context={"request": request})
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 "count": len(posts),
                 "results": serializer.data,
             }
         )
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=60)
+        return response
 
 
 class PublicRuntimeBlogPostDetailView(PublicRuntimeSiteMixin, APIView):
@@ -91,7 +96,7 @@ class PublicRuntimeBlogPostDetailView(PublicRuntimeSiteMixin, APIView):
 
         now = timezone.now()
         post = get_object_or_404(
-            site.posts.select_related("featured_media").prefetch_related("categories", "tags"),
+            site.posts.select_related("featured_media", "primary_author").prefetch_related("categories", "tags", "related_posts"),
             slug=post_slug,
             status=Post.STATUS_PUBLISHED,
         )
@@ -99,16 +104,19 @@ class PublicRuntimeBlogPostDetailView(PublicRuntimeSiteMixin, APIView):
             return Response({"detail": "Published post not found."}, status=404)
 
         serializer = PublicRuntimePostSerializer(post, context={"request": request})
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 "post": serializer.data,
             }
         )
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=60)
+        return response
 
 
 __all__ = [
     "CommentViewSet",
+    "BlogAuthorViewSet",
     "PostCategoryViewSet",
     "PostTagViewSet",
     "PostViewSet",

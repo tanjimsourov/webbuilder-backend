@@ -134,3 +134,91 @@ class Invoice(TimeStampedModel):
 
     def __str__(self) -> str:
         return self.stripe_invoice_id or self.invoice_number or f"Invoice {self.pk}"
+
+
+class PlanEntitlement(TimeStampedModel):
+    plan = models.ForeignKey(SubscriptionPlan, related_name="entitlements", on_delete=models.CASCADE)
+    code = models.CharField(max_length=120)
+    enabled = models.BooleanField(default=True)
+    is_unlimited = models.BooleanField(default=False)
+    limit_value = models.BigIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["plan__slug", "code"]
+        constraints = [
+            models.UniqueConstraint(fields=["plan", "code"], name="payments_unique_plan_entitlement"),
+        ]
+
+    def __str__(self) -> str:
+        suffix = "unlimited" if self.is_unlimited else str(self.limit_value)
+        return f"{self.plan.slug}:{self.code}={suffix}"
+
+
+class WorkspaceSubscription(TimeStampedModel):
+    STATUS_TRIALING = "trialing"
+    STATUS_ACTIVE = "active"
+    STATUS_PAST_DUE = "past_due"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_CHOICES = [
+        (STATUS_TRIALING, "Trialing"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_PAST_DUE, "Past due"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    workspace = models.OneToOneField(Workspace, related_name="active_subscription", on_delete=models.CASCADE)
+    plan = models.ForeignKey(SubscriptionPlan, related_name="workspace_subscriptions", on_delete=models.PROTECT)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_TRIALING)
+    starts_at = models.DateTimeField(default=timezone.now)
+    trial_ends_at = models.DateTimeField(null=True, blank=True)
+    current_period_end = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    external_reference = models.CharField(max_length=255, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self) -> str:
+        return f"{self.workspace.slug}:{self.plan.slug}:{self.status}"
+
+
+class WorkspaceUsageRecord(TimeStampedModel):
+    METRIC_SITES = "sites"
+    METRIC_USERS = "users"
+    METRIC_AI_REQUESTS = "ai_requests"
+    METRIC_AI_TOKENS = "ai_tokens"
+    METRIC_ANALYTICS_EVENTS = "analytics_events"
+    METRIC_STORAGE_BYTES = "storage_bytes"
+    METRIC_CHOICES = [
+        (METRIC_SITES, "Sites"),
+        (METRIC_USERS, "Users"),
+        (METRIC_AI_REQUESTS, "AI requests"),
+        (METRIC_AI_TOKENS, "AI tokens"),
+        (METRIC_ANALYTICS_EVENTS, "Analytics events"),
+        (METRIC_STORAGE_BYTES, "Storage bytes"),
+    ]
+
+    workspace = models.ForeignKey(Workspace, related_name="usage_records", on_delete=models.CASCADE)
+    metric = models.CharField(max_length=40, choices=METRIC_CHOICES)
+    period_start = models.DateTimeField()
+    period_end = models.DateTimeField()
+    used_value = models.BigIntegerField(default=0)
+    limit_value = models.BigIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-period_start", "workspace__slug", "metric"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workspace", "metric", "period_start", "period_end"],
+                name="payments_unique_workspace_usage_period",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["workspace", "metric", "period_start"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.workspace.slug}:{self.metric}:{self.used_value}"

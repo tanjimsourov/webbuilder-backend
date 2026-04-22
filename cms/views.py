@@ -7,6 +7,7 @@ the app-local extension points for CMS logic.
 from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils.cache import patch_cache_control
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import permissions
@@ -16,6 +17,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from builder.views import (
+    AssetUsageReferenceViewSet as BuilderAssetUsageReferenceViewSet,
     BlockTemplateViewSet as BuilderBlockTemplateViewSet,
     MediaAssetViewSet as BuilderMediaAssetViewSet,
     MediaFolderViewSet as BuilderMediaFolderViewSet,
@@ -26,7 +28,12 @@ from builder.views import (
     PageReviewViewSet,
     PageTranslationViewSet as BuilderPageTranslationViewSet,
     PageViewSet as BuilderPageViewSet,
+    PreviewTokenViewSet as BuilderPreviewTokenViewSet,
+    PublishSnapshotViewSet as BuilderPublishSnapshotViewSet,
+    ReusableSectionViewSet as BuilderReusableSectionViewSet,
     RobotsTxtViewSet as BuilderRobotsTxtViewSet,
+    SiteShellViewSet as BuilderSiteShellViewSet,
+    ThemeTemplateViewSet as BuilderThemeTemplateViewSet,
     URLRedirectViewSet as BuilderURLRedirectViewSet,
     public_page,
     public_robots,
@@ -41,6 +48,7 @@ from cms.serializers import (
     PublicRuntimeSiteSettingsSerializer,
     PublicRuntimeSitemapEntrySerializer,
 )
+from cms.models import PublishSnapshot
 from cms.services import (
     apply_page_payload,
     build_public_meta_payload,
@@ -59,6 +67,7 @@ from cms.services import (
 from core.views import PublicRuntimeSiteMixin
 from domains.services import primary_public_domain_for_site
 from notifications.services import trigger_webhooks
+from shared.auth.audit import log_security_event
 
 
 class PageViewSet(BuilderPageViewSet):
@@ -80,6 +89,33 @@ class PageViewSet(BuilderPageViewSet):
             detail = exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}
             raise ValidationError(detail)
         queue_search_index("page", page.id)
+        PublishSnapshot.objects.create(
+            site=page.site,
+            target_type=PublishSnapshot.TARGET_PAGE,
+            target_id=page.id,
+            revision_label="Published snapshot",
+            snapshot={
+                "title": page.title,
+                "slug": page.slug,
+                "path": page.path,
+                "builder_data": page.builder_data,
+                "seo": page.seo,
+                "page_settings": page.page_settings,
+                "html": page.html,
+                "css": page.css,
+                "js": page.js,
+            },
+            actor=request.user if request.user.is_authenticated else None,
+            metadata={"source": "cms.page.publish"},
+        )
+        log_security_event(
+            "site.publish",
+            request=request,
+            actor=request.user if request.user.is_authenticated else None,
+            target_type="page",
+            target_id=str(page.pk),
+            metadata={"site_id": page.site_id, "path": page.path},
+        )
         serializer = self.get_serializer(result["page"])
         return Response(serializer.data)
 
@@ -88,6 +124,33 @@ class PageViewSet(BuilderPageViewSet):
         page = self.get_object()
         result = unpublish_page_content(page, actor=str(request.user), reason="manual_unpublish")
         queue_search_index("page", page.id)
+        PublishSnapshot.objects.create(
+            site=page.site,
+            target_type=PublishSnapshot.TARGET_PAGE,
+            target_id=page.id,
+            revision_label="Unpublished snapshot",
+            snapshot={
+                "title": page.title,
+                "slug": page.slug,
+                "path": page.path,
+                "builder_data": page.builder_data,
+                "seo": page.seo,
+                "page_settings": page.page_settings,
+                "html": page.html,
+                "css": page.css,
+                "js": page.js,
+            },
+            actor=request.user if request.user.is_authenticated else None,
+            metadata={"source": "cms.page.unpublish"},
+        )
+        log_security_event(
+            "site.unpublish",
+            request=request,
+            actor=request.user if request.user.is_authenticated else None,
+            target_type="page",
+            target_id=str(page.pk),
+            metadata={"site_id": page.site_id, "path": page.path},
+        )
         serializer = self.get_serializer(result["page"])
         return Response(serializer.data)
 
@@ -119,9 +182,15 @@ class PageViewSet(BuilderPageViewSet):
 
 
 PageTranslationViewSet = BuilderPageTranslationViewSet
+AssetUsageReferenceViewSet = BuilderAssetUsageReferenceViewSet
 MediaAssetViewSet = BuilderMediaAssetViewSet
 MediaFolderViewSet = BuilderMediaFolderViewSet
 BlockTemplateViewSet = BuilderBlockTemplateViewSet
+ReusableSectionViewSet = BuilderReusableSectionViewSet
+ThemeTemplateViewSet = BuilderThemeTemplateViewSet
+SiteShellViewSet = BuilderSiteShellViewSet
+PublishSnapshotViewSet = BuilderPublishSnapshotViewSet
+PreviewTokenViewSet = BuilderPreviewTokenViewSet
 URLRedirectViewSet = BuilderURLRedirectViewSet
 
 
@@ -203,7 +272,9 @@ class PublicRuntimeSiteLookupView(PublicRuntimeBaseView):
             "capabilities": public_site_capabilities(site),
         }
         serializer = PublicRuntimeSiteIdentitySerializer(payload)
-        return Response({"site": serializer.data})
+        response = Response({"site": serializer.data})
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=120)
+        return response
 
 
 class PublicRuntimePageLookupView(PublicRuntimeBaseView):
@@ -236,7 +307,7 @@ class PublicRuntimePageLookupView(PublicRuntimeBaseView):
             scheme=request.scheme,
         )
         serializer = PublicRuntimePageSerializer(page_payload)
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 "route": {
@@ -251,6 +322,8 @@ class PublicRuntimePageLookupView(PublicRuntimeBaseView):
                 "meta": meta_payload,
             }
         )
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=120)
+        return response
 
 
 class PublicRuntimeNavigationView(PublicRuntimeBaseView):
@@ -260,13 +333,15 @@ class PublicRuntimeNavigationView(PublicRuntimeBaseView):
         site, _ = self.resolve_public_site(request)
         menus = site.navigation_menus.filter(is_active=True).order_by("location", "name")
         serializer = PublicRuntimeMenuSerializer(menus, many=True)
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 "menus": serializer.data,
                 "legacy_navigation": site.navigation if isinstance(site.navigation, list) else [],
             }
         )
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=120)
+        return response
 
 
 class PublicRuntimeSiteSettingsView(PublicRuntimeBaseView):
@@ -279,7 +354,9 @@ class PublicRuntimeSiteSettingsView(PublicRuntimeBaseView):
             "settings": public_site_settings(site),
         }
         serializer = PublicRuntimeSiteSettingsSerializer(payload)
-        return Response(serializer.data)
+        response = Response(serializer.data)
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=120)
+        return response
 
 
 class PublicRuntimeSEOView(PublicRuntimeBaseView):
@@ -304,7 +381,7 @@ class PublicRuntimeSEOView(PublicRuntimeBaseView):
             canonical_domain=canonical_domain,
             scheme=request.scheme,
         )
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 "path": page_resolution.normalized_path,
@@ -313,6 +390,8 @@ class PublicRuntimeSEOView(PublicRuntimeBaseView):
                 "seo": page_payload.get("seo", {}),
             }
         )
+        patch_cache_control(response, public=True, max_age=60, s_maxage=300, stale_while_revalidate=120)
+        return response
 
 
 class PublicRuntimeRobotsView(PublicRuntimeBaseView):
@@ -329,12 +408,14 @@ class PublicRuntimeRobotsView(PublicRuntimeBaseView):
         else:
             sitemap_url = request.build_absolute_uri("/sitemap.xml")
         payload = public_robots_payload(site, sitemap_url=sitemap_url)
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 **payload,
             }
         )
+        patch_cache_control(response, public=True, max_age=300, s_maxage=900, stale_while_revalidate=300)
+        return response
 
 
 class PublicRuntimeSitemapView(PublicRuntimeBaseView):
@@ -354,26 +435,34 @@ class PublicRuntimeSitemapView(PublicRuntimeBaseView):
             for entry in serialized_entries:
                 entry["absolute_url"] = f"{base_url}{entry['path']}"
 
-        return Response(
+        response = Response(
             {
                 "site": {"id": site.id, "slug": site.slug},
                 "entries": serialized_entries,
             }
         )
+        patch_cache_control(response, public=True, max_age=300, s_maxage=900, stale_while_revalidate=300)
+        return response
 
 
 __all__ = [
     "BlockTemplateViewSet",
+    "AssetUsageReferenceViewSet",
     "MediaAssetViewSet",
     "MediaFolderViewSet",
     "NavigationMenuViewSet",
+    "PreviewTokenViewSet",
+    "PublishSnapshotViewSet",
     "PageExperimentViewSet",
     "PageRevisionViewSet",
     "PageReviewCommentViewSet",
     "PageReviewViewSet",
     "PageTranslationViewSet",
     "PageViewSet",
+    "ReusableSectionViewSet",
     "RobotsTxtViewSet",
+    "SiteShellViewSet",
+    "ThemeTemplateViewSet",
     "URLRedirectViewSet",
     "public_page",
     "public_robots",

@@ -7,6 +7,7 @@ from rest_framework import serializers
 from cms.models import NavigationMenu
 
 from builder.serializers import (  # noqa: F401
+    AssetUsageReferenceSerializer,
     BlockTemplateSerializer,
     BuilderSaveSerializer,
     CollaboratorUserSerializer,
@@ -23,7 +24,12 @@ from builder.serializers import (  # noqa: F401
     PageReviewSerializer,
     PageSerializer,
     PageTranslationSerializer,
+    PreviewTokenSerializer,
+    PublishSnapshotSerializer,
+    ReusableSectionSerializer,
+    SiteShellSerializer,
     SiteMirrorImportSerializer,
+    ThemeTemplateSerializer,
     URLRedirectSerializer,
 )
 
@@ -174,6 +180,7 @@ __all__ = [
     "BlockTemplateSerializer",
     "BuilderSaveSerializer",
     "CollaboratorUserSerializer",
+    "AssetUsageReferenceSerializer",
     "DomainAvailabilitySerializer",
     "DomainContactSerializer",
     "DomainSerializer",
@@ -187,7 +194,12 @@ __all__ = [
     "PageReviewSerializer",
     "PageSerializer",
     "PageTranslationSerializer",
+    "PreviewTokenSerializer",
+    "PublishSnapshotSerializer",
+    "ReusableSectionSerializer",
+    "SiteShellSerializer",
     "SiteMirrorImportSerializer",
+    "ThemeTemplateSerializer",
     "URLRedirectSerializer",
     "PublicRuntimeLocaleSerializer",
     "PublicRuntimeMenuSerializer",

@@ -9,6 +9,7 @@ Chosen integrations:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import ssl
 import subprocess
@@ -28,6 +29,7 @@ from core.models import Site
 from domains.models import Domain, DomainAvailability, DomainContact, DomainMapping, SSLCertificate
 
 logger = logging.getLogger(__name__)
+DOMAIN_NAME_RE = re.compile(r"^(?!-)(?:[a-z0-9-]{1,63}\.)+[a-z]{2,63}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,13 @@ def normalize_runtime_host(host: str | None) -> str:
     if ":" in normalized and not normalized.startswith("["):
         normalized = normalized.split(":", 1)[0].strip()
     return normalized.rstrip(".")
+
+
+def _validate_domain_name(domain_name: str) -> str:
+    value = (domain_name or "").strip().lower().rstrip(".")
+    if not DOMAIN_NAME_RE.fullmatch(value):
+        raise ValueError("Invalid domain format.")
+    return value
 
 
 def host_from_request(request: HttpRequest) -> str:
@@ -298,6 +307,7 @@ def _cert_expiry_from_pem(cert_path: Path) -> datetime:
 
 
 def _request_letsencrypt_certificate(domain_name: str) -> tuple[str, str, datetime]:
+    domain_name = _validate_domain_name(domain_name)
     certbot_bin = (getattr(settings, "CERTBOT_BIN", "") or "certbot").strip()
     certbot = shutil.which(certbot_bin)
     if not certbot:
@@ -382,7 +392,7 @@ def _schedule_ssl_renewal(domain: Domain) -> None:
 
 def check_domain_availability(domain_name: str) -> DomainAvailability:
     """Check registrar availability and persist a result row."""
-    clean_domain = domain_name.strip().lower()
+    clean_domain = _validate_domain_name(domain_name)
     details = builder_domain_services.check_availability(clean_domain)
     availability = DomainAvailability.objects.create(
         domain_name=clean_domain,
@@ -397,21 +407,22 @@ def check_domain_availability(domain_name: str) -> DomainAvailability:
 
 def check_domain_availability_details(domain_name: str) -> dict[str, Any]:
     """Return raw registrar/WHOIS availability details."""
-    return builder_domain_services.check_availability(domain_name.strip().lower())
+    return builder_domain_services.check_availability(_validate_domain_name(domain_name))
 
 
 def verify_domain_ownership(domain_name: str, token: str) -> tuple[bool, str]:
     """Verify ownership via DNS TXT lookup."""
-    return builder_domain_services.verify_domain_ownership(domain_name.strip().lower(), token)
+    return builder_domain_services.verify_domain_ownership(_validate_domain_name(domain_name), token)
 
 
 def fetch_domain_whois(domain_name: str) -> dict[str, Any]:
     """Return parsed WHOIS information."""
-    return builder_domain_services.whois_query(domain_name.strip().lower())
+    return builder_domain_services.whois_query(_validate_domain_name(domain_name))
 
 
 def provision_domain(domain: Domain, contact: DomainContact) -> None:
     """Register a domain, configure DNS, issue TLS, and schedule renewal."""
+    domain.domain_name = _validate_domain_name(domain.domain_name)
     was_unregistered = domain.registration_status == Domain.REG_STATUS_UNREGISTERED
     domain.last_verification_attempt = datetime.now(timezone.utc)
     domain.registration_status = Domain.REG_STATUS_PENDING_TRANSFER

@@ -25,6 +25,7 @@ from core.views import SitePermissionMixin
 from forms.models import Form, FormSubmission
 from forms.serializers import FormSerializer, FormSubmissionSerializer
 from forms.services import trigger_webhooks
+from shared.contracts.sanitize import sanitize_json_payload
 
 
 class FormViewSet(SitePermissionMixin, viewsets.ModelViewSet):
@@ -234,7 +235,7 @@ class PublicFormView(APIView):
             site=site,
             page=page,
             form_name=form.slug,
-            payload=payload,
+            payload=sanitize_json_payload(payload),
             status=FormSubmission.STATUS_NEW,
         )
         record_conversion_from_assignments(

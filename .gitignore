@@ -4,10 +4,12 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.pyc.*
 
 # Virtual environments
 .venv/
 venv/
+.sixth/
 
 # Environment and secrets
 .env
@@ -18,14 +20,17 @@ venv/
 db.sqlite3
 test_db.sqlite3
 media/
+media/uploads/
 staticfiles/
 *.log
 
 # Project runtime outputs
 output/
 .test-media/
+.test-mirror-root/
 .tmp/
 .pip-cache/
+.deps/
 pip-build-tracker-*/
 pip-download-*/
 pip-unpack-*/
@@ -34,3 +39,6 @@ pip-unpack-*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/

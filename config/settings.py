@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,13 @@ if DEPS_DIR.exists():
     sys.path.insert(0, str(DEPS_DIR))
 
 MIRROR_IMPORT_ROOT = Path(os.environ.get("MIRROR_IMPORT_ROOT", BASE_DIR / ".mirror-imports")).expanduser()
+
+from shared.config.aliases import apply_env_aliases
+from shared.config.validation import environment_is_production, missing_required_env
+
+# Allow generic `APP_*`/`DATABASE_URL`/`REDIS_URL` conventions to map into the
+# repo's canonical `DJANGO_*` configuration variables.
+apply_env_aliases()
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -73,6 +81,9 @@ if RUNNING_TESTS and USE_SQLITE_FOR_TESTS:
 
 DEBUG = env_bool("DJANGO_DEBUG", RUNNING_TESTS)
 IS_PRODUCTION = not DEBUG and not RUNNING_TESTS
+APP_ENV = env_str("APP_ENV", "production" if IS_PRODUCTION else "development")
+APP_PORT = int(env_str("APP_PORT", "8000"))
+APP_URL = env_str("APP_URL")
 
 
 def _looks_like_placeholder_secret(value: str) -> bool:
@@ -345,6 +356,8 @@ INSTALLED_APPS = [
     "commerce",
     "forms",
     "blog",
+    "website",
+    "provider",
     "analytics",
     "notifications",
     "jobs",
@@ -359,13 +372,18 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
+    "shared.http.middleware.RequestContextMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "shared.http.security_headers.RequestHardeningMiddleware",
+    "shared.http.security_headers.SecurityHeadersMiddleware",
     "builder.middleware.AdminAccessMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "builder.middleware.RedirectMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "shared.http.auth_tracking.AuthSessionTrackingMiddleware",
+    "shared.http.middleware.RequestLoggingMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -407,6 +425,16 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
+]
+if importlib.util.find_spec("argon2") is not None:
+    PASSWORD_HASHERS.insert(0, "django.contrib.auth.hashers.Argon2PasswordHasher")
+elif importlib.util.find_spec("bcrypt") is not None:
+    PASSWORD_HASHERS.insert(0, "django.contrib.auth.hashers.BCryptSHA256PasswordHasher")
+else:
+    PASSWORD_HASHERS.insert(0, "django.contrib.auth.hashers.ScryptPasswordHasher")
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
@@ -416,7 +444,8 @@ USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_ROOT = Path(env_str("DJANGO_MEDIA_ROOT", str(BASE_DIR / "var" / "media"))).expanduser()
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
@@ -464,6 +493,8 @@ _validate_origin_list(
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "shared.auth.api_key_auth.PersonalAPIKeyAuthentication",
+        "shared.auth.access_token_auth.SignedAccessTokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
@@ -486,9 +517,13 @@ REST_FRAMEWORK = {
         "user": os.environ.get("DJANGO_THROTTLE_USER", "1000/hour"),
         "burst": os.environ.get("DJANGO_THROTTLE_BURST", "60/minute"),
         "auth_login": os.environ.get("DJANGO_THROTTLE_AUTH_LOGIN", "20/minute"),
+        "auth_session": os.environ.get("DJANGO_THROTTLE_AUTH_SESSION", "60/minute"),
         "auth_bootstrap": os.environ.get("DJANGO_THROTTLE_AUTH_BOOTSTRAP", "10/hour"),
         "auth_magic_login": os.environ.get("DJANGO_THROTTLE_AUTH_MAGIC_LOGIN", "10/minute"),
+        "password_reset": os.environ.get("DJANGO_THROTTLE_PASSWORD_RESET", "8/hour"),
+        "email_verification": os.environ.get("DJANGO_THROTTLE_EMAIL_VERIFICATION", "12/hour"),
         "invitation_accept": os.environ.get("DJANGO_THROTTLE_INVITATION_ACCEPT", "30/hour"),
+        "admin_api": os.environ.get("DJANGO_THROTTLE_ADMIN_API", "120/minute"),
         "public_form": os.environ.get("DJANGO_THROTTLE_PUBLIC_FORM", "30/hour"),
         "public_comment": os.environ.get("DJANGO_THROTTLE_PUBLIC_COMMENT", "20/hour"),
         "public_checkout": os.environ.get("DJANGO_THROTTLE_PUBLIC_CHECKOUT", "60/hour"),
@@ -502,6 +537,19 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = env_str("DJANGO_SECURE_REFERRER_POLICY", "strict-origin-when-cross-origin")
 SECURE_CROSS_ORIGIN_OPENER_POLICY = env_str("DJANGO_SECURE_CROSS_ORIGIN_OPENER_POLICY", "same-origin")
 X_FRAME_OPTIONS = env_str("DJANGO_X_FRAME_OPTIONS", "SAMEORIGIN" if DEBUG else "DENY").upper()
+PERMISSIONS_POLICY_HEADER = env_str(
+    "DJANGO_PERMISSIONS_POLICY",
+    "geolocation=(), microphone=(), camera=(), payment=(), usb=(), browsing-topics=()",
+)
+CONTENT_SECURITY_POLICY = env_str(
+    "DJANGO_CONTENT_SECURITY_POLICY",
+    (
+        "default-src 'self'; img-src 'self' data: https:; font-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self' https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    ),
+)
+CSP_REPORT_ONLY = env_bool("DJANGO_CSP_REPORT_ONLY", False)
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = False
 DEFAULT_SAMESITE_POLICY = "Lax"
@@ -527,6 +575,22 @@ if _csrf_samesite == "none" and not CSRF_COOKIE_SECURE:
 
 if RUNNING_TESTS:
     SECURE_SSL_REDIRECT = False
+
+# ---------------------------------------------------------------------------
+# Request/Auth Security Controls
+# ---------------------------------------------------------------------------
+MAX_REQUEST_BODY_BYTES = int(env_str("DJANGO_MAX_REQUEST_BODY_BYTES", str(10 * 1024 * 1024)))
+AUTH_MAX_FAILED_LOGIN_ATTEMPTS = int(env_str("DJANGO_AUTH_MAX_FAILED_LOGIN_ATTEMPTS", "7"))
+AUTH_LOCKOUT_SECONDS = int(env_str("DJANGO_AUTH_LOCKOUT_SECONDS", "900"))
+AUTH_BACKOFF_MAX_SECONDS = int(env_str("DJANGO_AUTH_BACKOFF_MAX_SECONDS", "16"))
+AUTH_ACCESS_TOKEN_TTL_SECONDS = int(env_str("DJANGO_AUTH_ACCESS_TOKEN_TTL_SECONDS", "900"))
+AUTH_REFRESH_TOKEN_TTL_SECONDS = int(env_str("DJANGO_AUTH_REFRESH_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 30)))
+AUTH_MFA_CHALLENGE_TTL_SECONDS = int(env_str("DJANGO_AUTH_MFA_CHALLENGE_TTL_SECONDS", "300"))
+AUTH_EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = int(
+    env_str("DJANGO_AUTH_EMAIL_VERIFICATION_TOKEN_TTL_SECONDS", str(60 * 60 * 24))
+)
+AUTH_PASSWORD_RESET_TOKEN_TTL_SECONDS = int(env_str("DJANGO_AUTH_PASSWORD_RESET_TOKEN_TTL_SECONDS", str(60 * 30)))
+MALWARE_SCAN_MAX_BYTES = int(env_str("DJANGO_MALWARE_SCAN_MAX_BYTES", str(2 * 1024 * 1024)))
 
 # ---------------------------------------------------------------------------
 # Email Configuration
@@ -666,9 +730,14 @@ LOG_FORMAT = os.environ.get("DJANGO_LOG_FORMAT", "json" if not DEBUG else "stand
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "request_context": {
+            "()": "shared.logger.filters.RequestContextFilter",
+        },
+    },
     "formatters": {
         "standard": {
-            "format": "[{asctime}] {levelname} {name}: {message}",
+            "format": "[{asctime}] {levelname} {name} [{request_id}]: {message}",
             "style": "{",
         },
         "json": {
@@ -679,6 +748,7 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": LOG_FORMAT,
+            "filters": ["request_context"],
         }
     },
     "root": {
@@ -742,6 +812,13 @@ def _validate_production_settings() -> None:
     if not IS_PRODUCTION:
         return
 
+    if environment_is_production():
+        missing_generic = missing_required_env()
+        if missing_generic:
+            raise ImproperlyConfigured(
+                "Missing required environment variables: " + ", ".join(sorted(missing_generic))
+            )
+
     if CORS_ALLOW_ALL_ORIGINS:
         raise ImproperlyConfigured("CORS_ALLOW_ALL_ORIGINS must remain false in production.")
 
@@ -775,6 +852,22 @@ def _validate_production_settings() -> None:
         raise ImproperlyConfigured("DJANGO_SESSION_COOKIE_AGE must be a positive integer.")
     if X_FRAME_OPTIONS != "DENY":
         raise ImproperlyConfigured("DJANGO_X_FRAME_OPTIONS must be DENY in production.")
+    if not PERMISSIONS_POLICY_HEADER:
+        raise ImproperlyConfigured("DJANGO_PERMISSIONS_POLICY must be configured in production.")
+    if not CONTENT_SECURITY_POLICY:
+        raise ImproperlyConfigured("DJANGO_CONTENT_SECURITY_POLICY must be configured in production.")
+    if AUTH_MAX_FAILED_LOGIN_ATTEMPTS < 3:
+        raise ImproperlyConfigured("DJANGO_AUTH_MAX_FAILED_LOGIN_ATTEMPTS must be at least 3.")
+    if AUTH_LOCKOUT_SECONDS < 60:
+        raise ImproperlyConfigured("DJANGO_AUTH_LOCKOUT_SECONDS must be at least 60 seconds.")
+    if AUTH_ACCESS_TOKEN_TTL_SECONDS < 60:
+        raise ImproperlyConfigured("DJANGO_AUTH_ACCESS_TOKEN_TTL_SECONDS must be at least 60 seconds.")
+    if AUTH_MFA_CHALLENGE_TTL_SECONDS < 60:
+        raise ImproperlyConfigured("DJANGO_AUTH_MFA_CHALLENGE_TTL_SECONDS must be at least 60 seconds.")
+    if AUTH_REFRESH_TOKEN_TTL_SECONDS <= AUTH_ACCESS_TOKEN_TTL_SECONDS:
+        raise ImproperlyConfigured(
+            "DJANGO_AUTH_REFRESH_TOKEN_TTL_SECONDS must be greater than DJANGO_AUTH_ACCESS_TOKEN_TTL_SECONDS."
+        )
 
     db_config = DATABASES.get("default", {})
     db_engine = (db_config.get("ENGINE") or "").strip().lower()
@@ -826,35 +919,19 @@ def _validate_production_settings() -> None:
 _validate_production_settings()
 
 # ---------------------------------------------------------------------------
-# Sentry APM / Error Tracking (Production)
+# Observability bootstrap (error tracking + tracing)
 # ---------------------------------------------------------------------------
+ERROR_TRACKING_PROVIDER = env_str("ERROR_TRACKING_PROVIDER", "sentry")
+TRACING_PROVIDER = env_str("TRACING_PROVIDER", "none")
+OTEL_EXPORTER_OTLP_ENDPOINT = env_str("OTEL_EXPORTER_OTLP_ENDPOINT")
+OTEL_SERVICE_NAME = env_str("OTEL_SERVICE_NAME", "webbuilder-backend")
+
 SENTRY_DSN = env_str("SENTRY_DSN")
 SENTRY_ENVIRONMENT = env_str("SENTRY_ENVIRONMENT", "development" if DEBUG else "production")
 SENTRY_TRACES_SAMPLE_RATE = float(env_str("SENTRY_TRACES_SAMPLE_RATE", "0.1" if IS_PRODUCTION else "0"))
 SENTRY_PROFILES_SAMPLE_RATE = float(env_str("SENTRY_PROFILES_SAMPLE_RATE", "0.1" if IS_PRODUCTION else "0"))
 
-if SENTRY_DSN and IS_PRODUCTION:
-    import sentry_sdk
-    from sentry_sdk.integrations.django import DjangoIntegration
-    from sentry_sdk.integrations.logging import LoggingIntegration
+from shared.observability import configure_error_tracking, configure_tracing
 
-    sentry_sdk.init(
-        dsn=SENTRY_DSN,
-        environment=SENTRY_ENVIRONMENT,
-        integrations=[
-            DjangoIntegration(
-                transaction_style="url",
-                middleware_spans=True,
-            ),
-            LoggingIntegration(
-                level=None,  # Capture all levels
-                event_level=None,  # Don't send logs as events by default
-            ),
-        ],
-        traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
-        profiles_sample_rate=SENTRY_PROFILES_SAMPLE_RATE,
-        send_default_pii=False,  # Don't send PII by default
-        attach_stacktrace=True,
-        # Filter out health check transactions to reduce noise
-        traces_sampler=lambda ctx: 0 if ctx.get("wsgi_environ", {}).get("PATH_INFO", "").startswith("/api/health") else SENTRY_TRACES_SAMPLE_RATE,
-    )
+configure_error_tracking(globals())
+configure_tracing(globals())

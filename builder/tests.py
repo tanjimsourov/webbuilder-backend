@@ -669,9 +669,9 @@ class BuilderPlatformTests(TestCase):
         PAYLOAD_ECOMMERCE_PORT=5085,
         PAYLOAD_ECOMMERCE_DATABASE_URL="mongodb://127.0.0.1/payload-commerce",
         PAYLOAD_ECOMMERCE_SECRET="commerce-secret",
-        PAYLOAD_ECOMMERCE_STRIPE_SECRET_KEY="sk_test_demo",
-        PAYLOAD_ECOMMERCE_STRIPE_PUBLISHABLE_KEY="pk_test_demo",
-        PAYLOAD_ECOMMERCE_STRIPE_WEBHOOK_SECRET="whsec_demo",
+        PAYLOAD_ECOMMERCE_STRIPE_SECRET_KEY="stripe-secret-key-demo",
+        PAYLOAD_ECOMMERCE_STRIPE_PUBLISHABLE_KEY="stripe-publishable-key-demo",
+        PAYLOAD_ECOMMERCE_STRIPE_WEBHOOK_SECRET="stripe-webhook-secret-demo",
     )
     def test_payload_ecommerce_status_returns_vendor_metadata(self):
         ensure_seed_data()

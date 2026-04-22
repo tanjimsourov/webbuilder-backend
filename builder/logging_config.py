@@ -13,6 +13,11 @@ SENSITIVE_FIELD_MARKERS = {
     "token",
     "authorization",
     "api_key",
+    "apikey",
+    "client_secret",
+    "access_key",
+    "refresh",
+    "jwt",
     "private_key",
     "session",
     "cookie",
@@ -28,6 +33,10 @@ def _redact_sensitive(value, key: str | None = None):
         return {k: _redact_sensitive(v, k) for k, v in value.items()}
     if isinstance(value, list):
         return [_redact_sensitive(item, key) for item in value]
+    if isinstance(value, str):
+        lowered = value.lower()
+        if "bearer " in lowered or lowered.startswith("sk_") or "-----begin" in lowered:
+            return "[REDACTED]"
     return value
 
 

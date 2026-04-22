@@ -36,6 +36,7 @@ from cms.localization import select_best_locale
 from core.models import Site, SiteLocale
 from forms.models import Form
 from builder import services as builder_services
+from shared.seo import build_seo_payload, normalize_seo_payload
 
 BASE_BLOCK_CSS = builder_services.BASE_BLOCK_CSS
 ensure_global_block_templates = builder_services.ensure_global_block_templates
@@ -281,29 +282,25 @@ def build_public_meta_payload(
     canonical_url = str(seo.get("canonical_url") or "").strip()
     if not canonical_url and canonical_domain:
         canonical_url = f"{scheme}://{canonical_domain}{path}"
-
-    meta_title = str(seo.get("meta_title") or "").strip() or f"{site.name} | {title}"
-    meta_description = (
-        str(seo.get("meta_description") or "").strip()
-        or site.tagline
-        or site.description
-        or title
+    normalized = build_seo_payload(
+        title=title,
+        description=site.tagline or site.description or title,
+        canonical_url=canonical_url,
+        payload=seo,
+        default_title_prefix=f"{site.name} | ",
     )
-    no_index = bool(seo.get("no_index", False) or (seo.get("robots") or {}).get("no_index", False))
-    no_follow = bool(seo.get("no_follow", False) or (seo.get("robots") or {}).get("no_follow", False))
-
-    robots_tokens = []
-    robots_tokens.append("noindex" if no_index else "index")
-    robots_tokens.append("nofollow" if no_follow else "follow")
-
+    robots_tokens = [
+        "noindex" if normalized["robots"]["no_index"] else "index",
+        "nofollow" if normalized["robots"]["no_follow"] else "follow",
+    ]
     return {
-        "title": meta_title,
-        "description": meta_description,
-        "canonical_url": canonical_url,
+        "title": normalized["meta_title"],
+        "description": normalized["meta_description"],
+        "canonical_url": normalized["canonical_url"],
         "robots": ",".join(robots_tokens),
-        "open_graph": seo.get("og") if isinstance(seo.get("og"), dict) else {},
-        "twitter": seo.get("twitter") if isinstance(seo.get("twitter"), dict) else {},
-        "structured_data": seo.get("structured_data") if isinstance(seo.get("structured_data"), (dict, list)) else {},
+        "open_graph": normalized.get("open_graph") if isinstance(normalized.get("open_graph"), dict) else {},
+        "twitter": normalized.get("twitter") if isinstance(normalized.get("twitter"), dict) else {},
+        "structured_data": normalized.get("structured_data"),
     }
 
 
@@ -425,7 +422,12 @@ def public_sitemap_entries(site: Site) -> list[dict[str, Any]]:
     )
 
     entries: list[dict[str, Any]] = []
+    def _noindex(payload: dict | None) -> bool:
+        return normalize_seo_payload(payload).get("no_index", False)
+
     for page in pages:
+        if _noindex(page.seo if isinstance(page.seo, dict) else {}):
+            continue
         entries.append(
             {
                 "kind": "page",
@@ -435,6 +437,8 @@ def public_sitemap_entries(site: Site) -> list[dict[str, Any]]:
             }
         )
     for translation in translations:
+        if _noindex(translation.seo if isinstance(translation.seo, dict) else {}):
+            continue
         entries.append(
             {
                 "kind": "page_translation",
@@ -444,6 +448,8 @@ def public_sitemap_entries(site: Site) -> list[dict[str, Any]]:
             }
         )
     for post in posts:
+        if _noindex(post.seo if isinstance(post.seo, dict) else {}):
+            continue
         entries.append(
             {
                 "kind": "blog_post",
@@ -453,6 +459,8 @@ def public_sitemap_entries(site: Site) -> list[dict[str, Any]]:
             }
         )
     for product in products:
+        if _noindex(product.seo if isinstance(product.seo, dict) else {}):
+            continue
         entries.append(
             {
                 "kind": "product",
@@ -740,6 +748,11 @@ def publish_page_content(
         page.site,
         "page.published",
         {"page_id": page.id, "title": page.title, "path": page.path, "actor": actor},
+    )
+    trigger_webhooks(
+        page.site,
+        "site.published",
+        {"site_id": page.site_id, "source": "page", "page_id": page.id, "path": page.path},
     )
     return {"page": page, "routes": routes, "job": job}
 

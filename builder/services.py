@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
 from typing import Iterable
@@ -360,8 +361,11 @@ def _page_revision_fk_target_table() -> str:
 
 
 def _row_exists(table_name: str, row_id: int) -> bool:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name or ""):
+        raise ValueError("Unsafe table name.")
+    sql = "SELECT 1 FROM {} WHERE id = %s LIMIT 1".format(connection.ops.quote_name(table_name))
     with connection.cursor() as cursor:
-        cursor.execute(f"SELECT 1 FROM {connection.ops.quote_name(table_name)} WHERE id = %s LIMIT 1", [row_id])
+        cursor.execute(sql, [row_id])
         return cursor.fetchone() is not None
 
 
@@ -1639,8 +1643,8 @@ def trigger_webhooks(site, event: str, payload: dict) -> None:
     """Queue active webhook deliveries for *event* on *site*."""
     import logging
     from django.db import transaction
-    from .jobs import queue_webhook_delivery
-    from .models import Webhook
+    from .jobs import queue_automation_webhook_delivery, queue_webhook_delivery
+    from .models import AutomationWebhook, Webhook
 
     logger = logging.getLogger(__name__)
 
@@ -1656,6 +1660,9 @@ def trigger_webhooks(site, event: str, payload: dict) -> None:
         Webhook.objects.filter(site=site, event__in=compatible_events, status=Webhook.STATUS_ACTIVE)
         .values_list("pk", flat=True)
     )
+    automation_webhook_ids = list(
+        AutomationWebhook.objects.filter(site=site, event__in=compatible_events, is_active=True).values_list("pk", flat=True)
+    )
 
     def _enqueue_deliveries():
         for wid in webhook_ids:
@@ -1664,6 +1671,11 @@ def trigger_webhooks(site, event: str, payload: dict) -> None:
             except Exception:
                 logger.exception("Failed to queue webhook delivery %s; falling back to inline dispatch.", wid)
                 _dispatch_webhook(wid, payload)
+        for wid in automation_webhook_ids:
+            try:
+                queue_automation_webhook_delivery(wid, event, payload)
+            except Exception:
+                logger.exception("Failed to queue automation webhook delivery %s", wid)
 
     if transaction.get_connection().in_atomic_block:
         transaction.on_commit(_enqueue_deliveries)

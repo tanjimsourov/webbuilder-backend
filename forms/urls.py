@@ -6,6 +6,7 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from forms.views import (
+    FormSubmissionExportView,
     FormSubmissionViewSet,
     FormViewSet,
     PublicFormSubmissionView,
@@ -19,6 +20,7 @@ router.register("forms", FormViewSet, basename="form")
 router.register("submissions", FormSubmissionViewSet, basename="submission")
 
 urlpatterns = [
+    path("forms/<int:form_id>/export/", FormSubmissionExportView.as_view(), name="form-submission-export"),
     path("public/forms/submit/", PublicFormSubmissionView.as_view(), name="public-form-submit"),
     path("public/forms/<slug:site_slug>/<slug:form_slug>/", PublicFormView.as_view(), name="public-form-view"),
     path(

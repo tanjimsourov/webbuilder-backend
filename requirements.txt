@@ -1,6 +1,7 @@
 Django>=5.2,<5.3
 djangorestframework>=3.16,<3.17
 django-cors-headers>=4.6,<5.1
+argon2-cffi>=23.1,<26.0
 gunicorn>=23.0,<24.0
 psycopg[binary]>=3.2,<3.3
 meilisearch>=0.34,<0.35

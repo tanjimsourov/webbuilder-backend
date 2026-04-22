@@ -1,7 +1,8 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Order, PlatformEmailCampaign, PlatformOffer, PlatformSubscription, Workspace
+from core.models import SecurityAuditLog, SiteMembership, UserAccount
+from .models import Order, PlatformEmailCampaign, PlatformOffer, PlatformSubscription, Workspace, WorkspaceMembership
 
 
 User = get_user_model()
@@ -118,6 +119,10 @@ class PlatformAdminUserSerializer(serializers.ModelSerializer):
     workspace_count = serializers.IntegerField(read_only=True)
     site_count = serializers.IntegerField(read_only=True)
     order_count = serializers.IntegerField(read_only=True)
+    account_status = serializers.CharField(source="account.status", read_only=True)
+    support_agent = serializers.BooleanField(source="account.is_support_agent", read_only=True)
+    mfa_enabled = serializers.BooleanField(source="account.mfa_enabled", read_only=True)
+    email_verified = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -129,10 +134,18 @@ class PlatformAdminUserSerializer(serializers.ModelSerializer):
             "is_active",
             "date_joined",
             "last_login",
+            "account_status",
+            "support_agent",
+            "mfa_enabled",
+            "email_verified",
             "workspace_count",
             "site_count",
             "order_count",
         ]
+
+    def get_email_verified(self, obj) -> bool:
+        account = getattr(obj, "account", None)
+        return bool(account and account.email_verified_at)
 
 
 class PlatformAdminWorkspaceSerializer(serializers.ModelSerializer):
@@ -179,4 +192,90 @@ class PlatformAdminRecentOrderSerializer(serializers.ModelSerializer):
             "currency",
             "total",
             "placed_at",
+        ]
+
+
+class PlatformAdminUserRoleUpdateSerializer(serializers.Serializer):
+    is_superuser = serializers.BooleanField(required=False)
+    is_staff = serializers.BooleanField(required=False)
+    is_support_agent = serializers.BooleanField(required=False)
+    account_status = serializers.ChoiceField(choices=UserAccount.STATUS_CHOICES, required=False)
+
+
+class PlatformAdminWorkspaceMembershipSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source="user.username", read_only=True)
+    email = serializers.EmailField(source="user.email", read_only=True)
+
+    class Meta:
+        model = WorkspaceMembership
+        fields = [
+            "id",
+            "workspace",
+            "user",
+            "username",
+            "email",
+            "role",
+            "status",
+            "invited_by",
+            "accepted_at",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class PlatformAdminWorkspaceMembershipUpsertSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField(min_value=1)
+    role = serializers.ChoiceField(choices=WorkspaceMembership.ROLE_CHOICES)
+    status = serializers.ChoiceField(choices=WorkspaceMembership.STATUS_CHOICES, required=False)
+
+
+class PlatformAdminSiteMembershipSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source="user.username", read_only=True)
+    email = serializers.EmailField(source="user.email", read_only=True)
+
+    class Meta:
+        model = SiteMembership
+        fields = [
+            "id",
+            "site",
+            "user",
+            "username",
+            "email",
+            "role",
+            "status",
+            "granted_by",
+            "accepted_at",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class PlatformAdminSiteMembershipUpsertSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField(min_value=1)
+    role = serializers.ChoiceField(choices=SiteMembership.ROLE_CHOICES)
+    status = serializers.ChoiceField(choices=SiteMembership.STATUS_CHOICES, required=False)
+
+
+class PlatformAdminImpersonationSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField(min_value=1)
+    reason = serializers.CharField(max_length=280, required=False, allow_blank=True)
+
+
+class PlatformAdminSecurityTimelineSerializer(serializers.ModelSerializer):
+    actor_username = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = SecurityAuditLog
+        fields = [
+            "id",
+            "created_at",
+            "action",
+            "actor",
+            "actor_username",
+            "target_type",
+            "target_id",
+            "request_id",
+            "ip_address",
+            "success",
+            "metadata",
         ]

@@ -62,10 +62,10 @@ class _AuthScopedThrottle(SimpleRateThrottle):
     def get_cache_key(self, request, view):
         if getattr(settings, "RUNNING_TESTS", False):
             return None
+        ident_parts = [f"ip:{self.get_ident(request)}"]
         if request.user.is_authenticated:
-            ident = f"user:{request.user.pk}"
-        else:
-            ident = f"ip:{self.get_ident(request)}"
+            ident_parts.append(f"user:{request.user.pk}")
+        ident = "|".join(ident_parts)
         return self.cache_format % {"scope": self.scope, "ident": ident}
 
 
@@ -91,3 +91,27 @@ class InvitationAcceptThrottle(_AuthScopedThrottle):
     """Rate limit for invitation token acceptance attempts."""
 
     scope = "invitation_accept"
+
+
+class AuthSessionThrottle(_AuthScopedThrottle):
+    """Rate limit for auth session-management endpoints."""
+
+    scope = "auth_session"
+
+
+class PasswordResetThrottle(_AuthScopedThrottle):
+    """Rate limit for password reset request/confirm endpoints."""
+
+    scope = "password_reset"
+
+
+class EmailVerificationThrottle(_AuthScopedThrottle):
+    """Rate limit for email verification flows."""
+
+    scope = "email_verification"
+
+
+class AdminAPIThrottle(_AuthScopedThrottle):
+    """Rate limit for privileged admin routes."""
+
+    scope = "admin_api"

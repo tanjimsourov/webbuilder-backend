@@ -10,6 +10,13 @@ def main() -> None:
     if deps_dir.exists():
         sys.path.insert(0, str(deps_dir))
 
+    try:
+        from shared.config.dotenv import load_dotenv
+
+        load_dotenv(current_dir / ".env")
+    except Exception:
+        pass
+
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
     from config.wsgi import application

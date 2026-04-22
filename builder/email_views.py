@@ -15,6 +15,7 @@ from .serializers import (
     MailboxCreateSerializer
 )
 from .views import SitePermissionMixin
+from shared.auth.audit import log_security_event
 
 
 class EmailDomainViewSet(SitePermissionMixin, viewsets.ModelViewSet):
@@ -132,6 +133,13 @@ class MailboxViewSet(SitePermissionMixin, viewsets.ModelViewSet):
 
         mailbox.password_hash = make_password(new_password)
         mailbox.save()
+        log_security_event(
+            "mailbox.password_change",
+            request=request,
+            actor=request.user if request.user.is_authenticated else None,
+            target_type="mailbox",
+            target_id=str(mailbox.pk),
+        )
         
         # Create provisioning task
         task = EmailProvisioningTask.objects.create(

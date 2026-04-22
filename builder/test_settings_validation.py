@@ -30,6 +30,26 @@ def _base_production_env() -> dict[str, str]:
     env.update(
         {
             "DJANGO_DEBUG": "false",
+            "APP_ENV": "production",
+            "APP_PORT": "8000",
+            "APP_URL": "https://api.example.com",
+            "DATABASE_URL": "postgresql://webbuilder:super-strong-db-password-1234567890@127.0.0.1:5432/webbuilder",
+            "REDIS_URL": "redis://127.0.0.1:6379/1",
+            "JWT_ACCESS_SECRET": "jwt-access-secret-abcdefghijklmnopqrstuvwxyz123456",
+            "JWT_REFRESH_SECRET": "jwt-refresh-secret-abcdefghijklmnopqrstuvwxyz123456",
+            "SESSION_SECRET": "prod-secret-key-1234567890abcdefghijklmnopqrstuvwxyz",
+            "CORS_ALLOWED_ORIGINS": "https://app.example.com",
+            "STORAGE_DRIVER": "local",
+            "STORAGE_BUCKET": "webbuilder-assets",
+            "SMTP_HOST": "smtp.example.com",
+            "SMTP_PORT": "587",
+            "SMTP_USER": "smtp-user",
+            "SMTP_PASS": "smtp-password-1234567890",
+            "STRIPE_SECRET_KEY": "stripe-secret-key-production-test-value-abcdefghijklmnopqrstuvwxyz",
+            "STRIPE_PUBLISHABLE_KEY": "stripe-publishable-key-production-test-value-abcdefghijklmnopqrstuvwxyz",
+            "STRIPE_WEBHOOK_SECRET": "stripe-webhook-secret-production-test-value-abcdefghijklmnopqrstuvwxyz",
+            "OPENAI_API_KEY": "openai-api-key-production-test-value-abcdefghijklmnopqrstuvwxyz",
+            "SENTRY_DSN": "https://A1b2C3d4E5f6A7b8C9d0@o0.ingest.sentry.io/1",
             "DJANGO_SECRET_KEY": "prod-secret-key-1234567890abcdefghijklmnopqrstuvwxyz",
             "DJANGO_ALLOWED_HOSTS": "api.example.com",
             "DJANGO_CORS_ALLOWED_ORIGINS": "https://app.example.com",
@@ -59,7 +79,6 @@ def _base_production_env() -> dict[str, str]:
             "UMAMI_ENABLED": "false",
             "PAYLOAD_CMS_ENABLED": "false",
             "PAYLOAD_ECOMMERCE_ENABLED": "false",
-            "SENTRY_DSN": "",
         }
     )
     return env
@@ -79,6 +98,7 @@ class SettingsValidationTests(TestCase):
     def test_production_fails_without_secret_key(self):
         env = _base_production_env()
         env.pop("DJANGO_SECRET_KEY", None)
+        env.pop("SESSION_SECRET", None)
 
         result = _run_manage_check(env)
 
@@ -97,11 +117,12 @@ class SettingsValidationTests(TestCase):
     def test_production_fails_without_cache_url(self):
         env = _base_production_env()
         env.pop("DJANGO_CACHE_URL", None)
+        env.pop("REDIS_URL", None)
 
         result = _run_manage_check(env)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("DJANGO_CACHE_URL must be set in production", result.stderr + result.stdout)
+        self.assertIn("Missing required environment variables: REDIS_URL", result.stderr + result.stdout)
 
     def test_production_fails_when_metrics_query_token_is_enabled(self):
         env = _base_production_env()
